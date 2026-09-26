@@ -4,6 +4,8 @@ A lightweight, Ubuntu-first MCP bridge with a terminal control plane.
 
 `cos-lite` keeps the useful local-machine capabilities of Chat On Steroids without Electron, a browser extension, or ChatGPT conversation automation. The normal runtime is one small Go daemon. Running `cos` opens a dependency-free TUI for projects, tunnel setup, logs, browser tools, semantic code intelligence, skills, and daemon/autostart control.
 
+v0.5 adds stateless multi-chat isolation, hot configuration reload, MCP Tasks, MCP Resources, hierarchical `AGENTS.md` instructions, and lightweight audit/OpenTelemetry tracing without adding a second daemon or a large dependency tree. v0.5.2 adds a live TUI Activity view with local-only bounded tool-output previews. **v0.6 is a performance-focused release**: Linux inotify replaces sub-second config polling, state is written only when it changes, Code Intel reuses language-server processes with idle eviction, audit/activity disk writes are batched asynchronously, browser contexts are garbage-collected after inactivity, and Skills/AGENTS metadata gets short-lived caches.
+
 ## What it looks like
 
 ```text
@@ -22,7 +24,7 @@ Exposed projects
  ○  /foundationdb          ~/Desktop/foundationdb
 
 ↑/↓ or j/k select   space exposure   a add   d remove   b browser   c code-intel
-s start/stop   r restart   t tunnel   i skills   l logs   u autostart   q quit TUI
+s start/stop   r restart   t tunnel   i skills   o activity   l logs   u autostart   q quit TUI
 ```
 
 Quitting the TUI does **not** stop the daemon.
@@ -57,9 +59,66 @@ Optional browser tools talk directly to a dedicated Chromium instance over CDP. 
 - `browser_action`
 - `browser_evaluate`
 
-### External MCP plugins
+### External MCP servers
 
-External stdio MCP servers can be configured in `plugins.json`. Their tools are exposed as `<plugin>.<tool>`.
+cos-lite uses **Codex's existing MCP configuration** as its only external MCP-server source of truth. Configure servers in:
+
+```text
+~/.codex/config.toml
+```
+
+using standard Codex `[mcp_servers.<name>]` tables. Enabled stdio servers are discovered automatically and their tools are exposed as `<server>.<tool>`. `CODEX_HOME` is respected when set. Changes to Codex's config are hot-reloaded by the daemon, so cos-lite keeps no separate external-MCP configuration file.
+
+## Stateless multi-chat isolation
+
+MCP `2026-07-28` is stateless. cos-lite combines explicit opaque capability handles with a request-scoped client/chat namespace:
+
+```text
+sess_<128-bit random>       terminal / PTY session
+plan_<128-bit random>       in-memory work plan
+browser_<128-bit random>    isolated Chromium context
+task_<128-bit random>       MCP Task
+```
+
+The first call that creates one of these states returns its handle. The caller passes that handle on later calls. Handles are not enumerable, are generated with cryptographic randomness, and are intentionally omitted from audit/trace targets. This is the actual authorization boundary for transient state in stateless MCP.
+
+For ChatGPT, an anonymized per-conversation value supplied in request metadata is hashed and used only to group status/audit events; the raw value is never persisted. It is **not** used as an authorization boundary. In normal use separate chats mint and retain different opaque handles, so their terminal sessions, plans, browser contexts, and Tasks stay separate unless a handle is deliberately copied between chats. The filesystem/project roots remain intentionally shared, so two chats can still edit the same repository at the same time and normal source-control/concurrency discipline still applies.
+
+## MCP Tasks
+
+cos-lite supports the `io.modelcontextprotocol/tasks` extension from MCP `2026-07-28`. If a client advertises that extension and an `exec_command` is still running after its initial yield, cos-lite returns a task handle instead of forcing the client to retain a live request.
+
+Supported task methods:
+
+```text
+tasks/get
+tasks/update
+tasks/cancel
+```
+
+`taskId` is an opaque capability handle. Clients that do not advertise the Tasks extension keep the existing `session_id` + `write_stdin` behavior unchanged. Tasks survive hot configuration reloads, but they are in-memory state and do not survive a daemon restart.
+
+## MCP Resources and project context
+
+cos-lite exposes first-class Resources alongside tools:
+
+```text
+cos://status
+cos://projects
+cos://projects/<project>
+cos://projects/<project>/git
+cos://projects/<project>/instructions
+cos://skills
+cos://audit/recent
+```
+
+Hierarchical project instructions use the existing `AGENTS.md` convention. Root-level instructions are included in server instructions when present. For a nested file or directory, clients can resolve the full applicable hierarchy with:
+
+```text
+cos://projects/<project>/instructions?path=src/pkg/file.go
+```
+
+The resolver walks from the configured project root down to the requested path, applying each `AGENTS.md` in order. Root instructions are part of the server instructions; additional nested instructions are also surfaced automatically on path-sensitive `read`, `find`, `view_image`, `code_intel`, `exec_command`, and `apply_patch` calls. Instruction reads are bounded and symlinked `AGENTS.md` files are ignored.
 
 ## Skills
 
@@ -128,7 +187,7 @@ Model-facing Skill paths never expose the native config directory. They look lik
 
 ## Semantic code intelligence
 
-`code_intel` talks directly to installed language servers. Servers start lazily for a request and are shut down afterward, so there is no idle LSP farm.
+`code_intel` talks directly to installed language servers. Servers start lazily and are reused per project/language so repeated semantic operations avoid language-server startup. Idle servers are evicted after about 5 minutes, so warm calls stay fast without leaving an unbounded LSP farm resident.
 
 For broad exposed roots, cos-lite selects the nearest language/project marker (`go.mod`, `Cargo.toml`, `tsconfig.json`, `pyproject.toml`, `CMakeLists.txt`, etc.) as the LSP root. File locations returned by an LSP outside approved project roots are redacted, and `workspace_symbols` filters external filesystem locations.
 
@@ -297,6 +356,7 @@ Relative paths are intentionally rejected when multiple roots are enabled, so a 
 | `r` | Restart daemon |
 | `t` | Tunnel setup |
 | `i` | Show discovered Skills |
+| `o` | Live MCP Activity / OpenTelemetry view |
 | `l` | Daemon logs |
 | `b` | Enable/disable browser MCP tools |
 | `c` | Enable/disable semantic code intelligence |
@@ -304,6 +364,8 @@ Relative paths are intentionally rejected when multiple roots are enabled, so a 
 | `q` | Quit TUI only |
 
 Adding, removing, enabling, or disabling a project reconciles the daemon immediately. With autostart enabled, adding the first project also starts the service automatically. Disabling/removing the final exposed project stops the daemon cleanly while keeping the autostart policy ready for the next enabled project.
+
+When the daemon is already running, project exposure, Skills, CodeIntel, Codex MCP-server configuration, and tunnel configuration are hot-reloaded without replacing the daemon process. Existing terminal sessions, MCP Tasks, plan handles, browser contexts, audit history, and the listening MCP socket survive ordinary reloads. Changing the configured listen address still requires an explicit daemon restart. Changing browser enable/headless settings can rotate the browser pool because those settings change the Chromium runtime itself.
 
 ## CLI control
 
@@ -314,6 +376,8 @@ cos restart
 cos status
 cos endpoint
 cos logs 100
+cos audit 100
+cos audit --json 100
 
 cos project list
 cos project add ~/Desktop/intern/trendseer trendseer
@@ -357,7 +421,7 @@ In the TUI:
 2. Choose `OpenAI Secure MCP Tunnel`.
 3. Enter the `tunnel_...` ID from OpenAI Tunnels management.
 4. Enter the Runtime API key created with Tunnels Read + Use permission.
-5. cos-lite restarts the daemon and waits for tunnel-client's `/readyz` before showing the tunnel as connected.
+5. cos-lite hot-reloads the tunnel child and waits for tunnel-client's `/readyz` before showing the tunnel as connected. The MCP daemon itself stays running.
 
 The runtime key is never written to `config.json` or passed in process arguments. It is stored separately at:
 
@@ -432,7 +496,7 @@ cos serve /absolute/path/to/project
 Or stdio:
 
 ```bash
-cos serve --transport stdio --browser=false --plugins none /absolute/path/to/project
+cos serve --transport stdio --browser=false /absolute/path/to/project
 ```
 
 Disable optional schemas in one-off mode if desired:
@@ -443,14 +507,64 @@ cos serve --skills=false --code-intel=false --browser=false /path/to/project
 
 ## Browser behavior
 
-Browser tools use a dedicated Chromium profile and an ephemeral loopback CDP port. No extension is installed and your normal browser profile is not reused.
+Browser tools use isolated Chromium contexts. Omitting `browser_context_id` uses a stable per-client default context, which keeps older cached connector schemas working. `browser_tabs` returns that context's random `browser_...` handle; pass it explicitly for portable stateless use. Set `new_context: true` on `browser_tabs` to mint an additional context. Each handle maps to a dedicated Chromium profile and ephemeral loopback CDP port. No extension is installed and your normal browser profile is not reused.
+
+Browser context handles are bearer capabilities. Separate chats normally mint different handles and therefore operate separate Chromium profiles; deliberately copying a valid `browser_context_id` to another chat grants access to that transient browser context. Client metadata is not an authentication boundary.
+
+## Audit and OpenTelemetry
+
+Every MCP request records a bounded audit event containing only operational metadata: timestamp, duration, diagnostic client label, method/tool/resource category, status, trace ID, and span ID. Tool arguments, command text, file contents, API keys, session/plan/browser/task capability handles, and MCP path tokens are not written to the audit record.
+
+Inspect it with:
+
+```bash
+cos audit 100
+cos audit --json 100
+```
+
+The JSONL file is mode `0600` and rotates at a bounded size:
+
+```text
+~/.local/state/cos-lite/audit.jsonl
+```
+
+Set a standard OTLP/HTTP endpoint to export spans without installing an OpenTelemetry SDK dependency:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer ...'
+export OTEL_SERVICE_NAME=cos-lite
+```
+
+cos-lite posts OTLP JSON to `/v1/traces`, propagates HTTP `traceparent`/`tracestate`, and drops exporter work if the bounded async queue is full rather than blocking MCP requests.
+
+### TUI Activity view
+
+Press `o` in the TUI to open the live **MCP Activity / OpenTelemetry** screen. It shows recent operations with timestamp, status, client/chat label, tool/resource/task name, latency, trace ID and span ID. The selected event also shows a short textual output preview.
+
+Controls:
+
+```text
+↑ / k    older event
+↓ / j    newer event
+g        jump to latest
+Enter/q  return
+```
+
+Output previews are intentionally **not** added to `audit.jsonl` and are **not** exported through OTLP. They are stored only in a separate local mode-`0600` bounded file used by the TUI:
+
+```text
+~/.local/state/cos-lite/activity.jsonl
+```
+
+The preview is capped at about 1.2k characters, ignores image/audio/base64 content, strips terminal control sequences, and redacts obvious bearer tokens, API keys, passwords, secrets and MCP path tokens. Because arbitrary tool output can still contain sensitive source code or application data, treat `activity.jsonl` as private local state.
 
 ## Plugin configuration
 
 Default file:
 
 ```text
-~/.config/cos-lite/plugins.json
+~/.codex/config.toml            # external MCP servers (shared with Codex)
 ```
 
 Example:
@@ -491,6 +605,8 @@ The OpenAI tunnel runtime API key is stored separately in `~/.config/cos-lite/op
 
 Filesystem tools canonicalize configured roots, resolve symlinks, reject root escapes, and require explicit project names when multiple roots are enabled.
 
+Transient state uses opaque bearer-capability handles (`sess_...`, `plan_...`, `browser_...`, `task_...`) rather than trusting self-reported MCP client metadata. Keep those handles private. This prevents accidental cross-workflow enumeration and interference, but it is not a substitute for user authentication or OS-level multi-tenant isolation. If cos-lite is ever exposed to mutually untrusted users, use proper MCP/OAuth authorization and a dedicated Unix account/container/VM boundary.
+
 Skills are local instructions. Discovery refuses symlinked Skill directories/files, package imports are bounded, and model-facing metadata uses standard `.agents/skills` paths rather than cos-lite-specific skill locations.
 
 Language servers are trusted local executables. `code_intel` launches them with the project as the working directory and strips common LLM/MCP API secrets from their environment, but an LSP process still runs with your Unix account privileges.
@@ -502,6 +618,8 @@ Daemon state/logs:
 ```text
 ~/.local/state/cos-lite/
 ```
+
+The same directory contains `audit.jsonl`; audit events intentionally exclude tool arguments and file contents.
 
 Configuration and managed Skills:
 
@@ -519,7 +637,7 @@ make smoke
 make dist
 ```
 
-`make smoke` runs MCP, Skills, process, plugin, browser/CDP, and persistent control-plane binary tests. Unit tests also run an in-process fake LSP protocol server; release validation additionally exercises a real installed `clangd` when available.
+`make smoke` runs MCP, Skills, process, Codex-configured external MCP proxying, browser/CDP, persistent control-plane hot reload, OpenAI tunnel lifecycle, and multi-chat isolation/Tasks/Resources/AGENTS/audit tests. Unit tests also run an in-process fake LSP protocol server; release validation additionally exercises installed language servers when available.
 
 ## License
 

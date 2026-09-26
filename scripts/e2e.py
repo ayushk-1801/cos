@@ -61,6 +61,10 @@ def call(url, request_id, name, arguments):
 
 
 def start_http(binary, workspace, *extra):
+    env = os.environ.copy()
+    codex_home = Path(workspace) / ".codex-e2e"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    env["CODEX_HOME"] = str(codex_home)
     proc = subprocess.Popen(
         [
             binary,
@@ -76,6 +80,7 @@ def start_http(binary, workspace, *extra):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        env=env,
     )
     deadline = time.time() + 8
     seen = []
@@ -111,7 +116,7 @@ def core_http(binary):
         skill_dir = root / ".agents" / "skills" / "smoke"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("---\nname: Smoke Skill\ndescription: Verify skill discovery.\n---\n# Smoke\nUse read and tests.\n")
-        proc, url = start_http(binary, td, "--browser=false", "--plugins", "none")
+        proc, url = start_http(binary, td, "--browser=false")
         try:
             status, discovered = rpc(url, 1, "server/discover")
             assert status == 200, discovered
@@ -252,12 +257,17 @@ def core_http(binary):
 def stdio(binary):
     with tempfile.TemporaryDirectory() as td:
         Path(td, "x.txt").write_text("stdio\n")
+        env = os.environ.copy()
+        codex_home = Path(td) / ".codex-e2e"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        env["CODEX_HOME"] = str(codex_home)
         proc = subprocess.Popen(
-            [binary, "--transport", "stdio", "--browser=false", "--plugins", "none", td],
+            [binary, "--transport", "stdio", "--browser=false", td],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         requests = [
             {
@@ -315,31 +325,21 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc':'2.0','id':rid,'result':result}),flush=True)
 """
         )
-        config = root / "plugins.json"
-        config.write_text(
-            json.dumps(
-                [
-                    {
-                        "name": "fake",
-                        "command": [sys.executable, "-u", str(plugin)],
-                    }
-                ]
-            )
+        codex_home = root / ".codex-e2e"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        command = json.dumps(sys.executable)
+        script = json.dumps(str(plugin))
+        (codex_home / "config.toml").write_text(
+            f'[mcp_servers.fake]\ncommand = {command}\nargs = ["-u", {script}]\n'
         )
-        proc, url = start_http(
-            binary,
-            td,
-            "--browser=false",
-            "--plugins",
-            str(config),
-        )
+        proc, url = start_http(binary, td, "--browser=false")
         try:
             status, listed = rpc(url, 30, "tools/list")
             assert status == 200, listed
             assert any(tool["name"] == "fake.echo" for tool in listed["result"]["tools"]), listed
             result = call(url, 31, "fake.echo", {"text": "plugin-ok"})
             assert result["content"][0]["text"] == "plugin-ok", result
-            print("[ok] external MCP plugin proxy")
+            print("[ok] Codex-configured external MCP proxy")
         finally:
             stop(proc)
 
@@ -357,53 +357,78 @@ def browser(binary):
         print("[skip] browser CDP (Chromium/Chrome not installed)")
         return
     with tempfile.TemporaryDirectory() as td:
-        proc, url = start_http(binary, td, "--plugins", "none")
+        proc, url = start_http(binary, td)
         try:
             result = call(url, 40, "browser_tabs", {"action": "list"})
-            tabs = result["structuredContent"]
+            browser_context_id = result["structuredContent"]["browser_context_id"]
+            tabs = result["structuredContent"]["tabs"]
+            assert browser_context_id.startswith("browser_") and len(browser_context_id) == len("browser_") + 32, result
             assert tabs, result
             original = tabs[0]["id"]
 
-            created = call(url, 41, "browser_tabs", {"action": "new", "url": "about:blank"})
-            tab_id = created["structuredContent"]["id"]
-            call(url, 42, "browser_navigate", {"tab_id": tab_id, "url": "about:blank"})
+            # Explicitly mint a second opaque browser capability backed by a
+            # separate Chromium profile/process.
+            result2 = call(url, 401, "browser_tabs", {"action": "list", "new_context": True})
+            browser_context_id_2 = result2["structuredContent"]["browser_context_id"]
+            tabs2 = result2["structuredContent"]["tabs"]
+            assert browser_context_id_2 != browser_context_id, (browser_context_id, browser_context_id_2)
+            assert tabs2, result2
+            assert not ({t["id"] for t in tabs} & {t["id"] for t in tabs2}), (tabs, tabs2)
+            original2 = tabs2[0]["id"]
+            call(url, 402, "browser_evaluate", {"browser_context_id": browser_context_id, "tab_id": original, "expression": "document.title='context-one'"})
+            call(url, 403, "browser_evaluate", {"browser_context_id": browser_context_id_2, "tab_id": original2, "expression": "document.title='context-two'"})
+            title1 = call(url, 404, "browser_evaluate", {"browser_context_id": browser_context_id, "tab_id": original, "expression": "document.title"})
+            title2 = call(url, 405, "browser_evaluate", {"browser_context_id": browser_context_id_2, "tab_id": original2, "expression": "document.title"})
+            assert title1["structuredContent"] == "context-one", title1
+            assert title2["structuredContent"] == "context-two", title2
+
+            # Legacy/cached client schemas that do not know browser_context_id
+            # still operate on the stable per-client default context.
+            legacy_title = call(url, 406, "browser_evaluate", {"tab_id": original, "expression": "document.title"})
+            assert legacy_title["structuredContent"] == "context-one", legacy_title
+
+            created = call(url, 41, "browser_tabs", {"action": "new", "browser_context_id": browser_context_id, "url": "about:blank"})
+            assert created["structuredContent"]["browser_context_id"] == browser_context_id, created
+            tab_id = created["structuredContent"]["tab"]["id"]
+            call(url, 42, "browser_navigate", {"browser_context_id": browser_context_id, "tab_id": tab_id, "url": "about:blank"})
             call(
                 url,
                 43,
                 "browser_evaluate",
                 {
+                    "browser_context_id": browser_context_id,
                     "tab_id": tab_id,
                     "expression": "(()=>{document.body.innerHTML='<input id=\"i\"><button id=\"b\">go</button>';document.querySelector('#b').onclick=()=>console.log('hit');return document.title='E2E'})()",
                 },
             )
-            result = call(url, 44, "browser_snapshot", {"tab_id": tab_id})
+            result = call(url, 44, "browser_snapshot", {"browser_context_id": browser_context_id, "tab_id": tab_id})
             assert "#i" in json.dumps(result), result
             call(
                 url,
                 45,
                 "browser_action",
-                {"tab_id": tab_id, "action": "fill", "selector": "#i", "value": "hello"},
+                {"browser_context_id": browser_context_id, "tab_id": tab_id, "action": "fill", "selector": "#i", "value": "hello"},
             )
             result = call(
                 url,
                 46,
                 "browser_evaluate",
-                {"tab_id": tab_id, "expression": "document.querySelector('#i').value"},
+                {"browser_context_id": browser_context_id, "tab_id": tab_id, "expression": "document.querySelector('#i').value"},
             )
             assert result["structuredContent"] == "hello", result
-            call(url, 47, "browser_action", {"tab_id": tab_id, "action": "click", "selector": "#b"})
-            result = call(url, 48, "browser_console", {"tab_id": tab_id})
+            call(url, 47, "browser_action", {"browser_context_id": browser_context_id, "tab_id": tab_id, "action": "click", "selector": "#b"})
+            result = call(url, 48, "browser_console", {"browser_context_id": browser_context_id, "tab_id": tab_id})
             assert "consoleAPICalled" in json.dumps(result), result
-            result = call(url, 49, "browser_network", {"tab_id": tab_id})
+            result = call(url, 49, "browser_network", {"browser_context_id": browser_context_id, "tab_id": tab_id})
             assert isinstance(result["structuredContent"], list), result
-            result = call(url, 50, "browser_screenshot", {"tab_id": tab_id})
+            result = call(url, 50, "browser_screenshot", {"browser_context_id": browser_context_id, "tab_id": tab_id})
             image = next(item for item in result["content"] if item.get("type") == "image")
             assert len(image["data"]) > 100, result
-            call(url, 51, "browser_tabs", {"action": "close", "tab_id": tab_id})
+            call(url, 51, "browser_tabs", {"action": "close", "browser_context_id": browser_context_id, "tab_id": tab_id})
             # The initial tab should remain reachable after closing the test tab.
-            result = call(url, 52, "browser_tabs", {"action": "list"})
-            assert any(tab["id"] == original for tab in result["structuredContent"]), result
-            print("[ok] Chromium CDP browser tools")
+            result = call(url, 52, "browser_tabs", {"action": "list", "browser_context_id": browser_context_id})
+            assert any(tab["id"] == original for tab in result["structuredContent"]["tabs"]), result
+            print("[ok] Chromium CDP browser tools + isolated browser contexts")
         finally:
             stop(proc)
 

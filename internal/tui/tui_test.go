@@ -3,8 +3,12 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/ayush/cos-lite/internal/clientctx"
+	"github.com/ayush/cos-lite/internal/telemetry"
 )
 
 func TestInputAcceptsQAndBackspace(t *testing.T) {
@@ -65,5 +69,32 @@ func TestClipText(t *testing.T) {
 	}
 	if got := clipText("abc", 5); got != "abc" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestActivityViewRendersToolAndOutput(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	r, err := telemetry.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := clientctx.With(context.Background(), clientctx.Info{Key: "chatgpt-session-abcdef12", Name: "ChatGPT"})
+	ctx, span := r.Begin(ctx)
+	r.EndWithPreview(ctx, span, "tools/call", "read", "ok", "hello activity output")
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	renderActivity(&b, 100, 30, 0)
+	got := b.String()
+	for _, want := range []string{"MCP Activity / OpenTelemetry", "tools/call read", "hello activity output", "ChatGPT"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("activity view missing %q:\n%s", want, got)
+		}
+	}
+	m := Model{screen: activityView}
+	m.handle(key{kind: "up"})
+	if m.activityOffset != 0 { // one event, so there is nowhere older to move.
+		t.Fatalf("activity offset=%d", m.activityOffset)
 	}
 }

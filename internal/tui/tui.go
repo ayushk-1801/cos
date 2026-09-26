@@ -20,6 +20,7 @@ import (
 	"github.com/ayush/cos-lite/internal/control"
 	"github.com/ayush/cos-lite/internal/service"
 	skillpkg "github.com/ayush/cos-lite/internal/skills"
+	"github.com/ayush/cos-lite/internal/telemetry"
 	tunnelpkg "github.com/ayush/cos-lite/internal/tunnel"
 	"github.com/ayush/cos-lite/internal/workspace"
 )
@@ -47,16 +48,18 @@ const (
 	logsView
 	confirmRemove
 	skillsView
+	activityView
 )
 
 type Model struct {
-	cfg      config.Config
-	selected int
-	screen   screen
-	input    string
-	message  string
-	binary   string
-	logsRaw  bool
+	cfg            config.Config
+	selected       int
+	screen         screen
+	input          string
+	message        string
+	binary         string
+	logsRaw        bool
+	activityOffset int
 }
 type key struct {
 	kind string
@@ -107,6 +110,24 @@ func (m *Model) handle(k key) bool {
 		return m.handleInput(k)
 	}
 	switch m.screen {
+	case activityView:
+		events, _ := telemetry.ReadActivity(200)
+		maxOffset := max(0, len(events)-1)
+		switch {
+		case (k.kind == "rune" && (k.r == 'q')) || k.kind == "esc" || k.kind == "enter":
+			m.screen = dashboard
+		case k.kind == "up" || (k.kind == "rune" && k.r == 'k'):
+			if m.activityOffset < maxOffset {
+				m.activityOffset++
+			}
+		case k.kind == "down" || (k.kind == "rune" && k.r == 'j'):
+			if m.activityOffset > 0 {
+				m.activityOffset--
+			}
+		case k.kind == "rune" && k.r == 'g':
+			m.activityOffset = 0
+		}
+		return false
 	case logsView:
 		if k.kind == "rune" && k.r == 'r' {
 			m.logsRaw = !m.logsRaw
@@ -210,6 +231,9 @@ func (m *Model) handle(k key) bool {
 			m.screen = logsView
 		case 'i':
 			m.screen = skillsView
+		case 'o':
+			m.screen = activityView
+			m.activityOffset = 0
 		case 'b':
 			m.cfg.Browser = !m.cfg.Browser
 			if err := config.Save(m.cfg); err != nil {
@@ -498,6 +522,8 @@ func render(w *os.File, m *Model) {
 		renderTunnel(&b, m)
 	case logsView:
 		renderLogs(&b, width, height, m.logsRaw)
+	case activityView:
+		renderActivity(&b, width, height, m.activityOffset)
 	case skillsView:
 		renderSkills(&b, m, height)
 	case confirmRemove:
@@ -563,6 +589,13 @@ func renderDashboard(b *strings.Builder, m *Model, width, height int) {
 	} else {
 		fmt.Fprintf(b, "Skills   %sdisabled%s %s(%d discovered)%s\n", dim, reset, dim, len(skills), reset)
 	}
+	if events, err := telemetry.ReadActivity(1); err == nil && len(events) > 0 {
+		e := events[len(events)-1]
+		op := strings.TrimSpace(strings.TrimSpace(e.Method + " " + e.Target))
+		fmt.Fprintf(b, "Activity %s%-28s%s %s%.1fms%s\n", cyan, clipText(op, 28), reset, dim, e.DurationMS, reset)
+	} else {
+		fmt.Fprintf(b, "Activity %sno calls yet%s\n", dim, reset)
+	}
 	if state.Endpoint != "" {
 		fmt.Fprintf(b, dim+"Local MCP %s"+reset+"\n", redactURL(state.Endpoint))
 	}
@@ -570,7 +603,7 @@ func renderDashboard(b *strings.Builder, m *Model, width, height int) {
 	if len(m.cfg.Projects) == 0 {
 		b.WriteString(dim + "  No projects yet. Press a to add one." + reset + "\n")
 	} else {
-		maxRows := height - 13
+		maxRows := height - 14
 		if maxRows < 3 {
 			maxRows = 3
 		}
@@ -599,7 +632,7 @@ func renderDashboard(b *strings.Builder, m *Model, width, height int) {
 			b.WriteString(line + "\n")
 		}
 	}
-	b.WriteString("\n" + dim + "↑/↓ or j/k select   space exposure   a add   d remove   b browser   c code-intel\n" + "s start/stop   r restart   t tunnel   i skills   l logs   u autostart   q quit TUI" + reset + "\n")
+	b.WriteString("\n" + dim + "↑/↓ or j/k select   space exposure   a add   d remove   b browser   c code-intel\n" + "s start/stop   r restart   t tunnel   i skills   o activity   l logs   u autostart   q quit TUI" + reset + "\n")
 	if m.message != "" {
 		b.WriteString("\n" + yellow + m.message + reset + "\n")
 	}
@@ -693,6 +726,120 @@ func renderLogs(b *strings.Builder, width, height int, raw bool) {
 		footer = "[r] compact logs   Enter/q return"
 	}
 	b.WriteString("\n" + dim + footer + reset + "\n")
+}
+
+func renderActivity(b *strings.Builder, width, height, offset int) {
+	fmt.Fprintf(b, "\n%sMCP Activity / OpenTelemetry%s\n", bold, reset)
+	b.WriteString(dim + "Tool/resource/task activity. Output previews are local-only and are not exported through OTLP.\n" + reset)
+	events, err := telemetry.ReadActivity(200)
+	if err != nil {
+		b.WriteString("\n" + red + err.Error() + reset + "\n")
+		return
+	}
+	if len(events) == 0 {
+		b.WriteString("\n" + dim + "No MCP activity yet." + reset + "\n\n" + dim + "Enter/q return" + reset + "\n")
+		return
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(events) {
+		offset = len(events) - 1
+	}
+	selected := len(events) - 1 - offset
+	listRows := min(10, max(4, (height-13)/2))
+	start := selected - listRows + 1
+	if start < 0 {
+		start = 0
+	}
+	end := min(len(events), start+listRows)
+	if selected >= end {
+		start = selected - listRows + 1
+		end = selected + 1
+	}
+
+	b.WriteString("\n" + dim + " TIME      STATUS  CLIENT             OPERATION                         LATENCY   TRACE" + reset + "\n")
+	for i := start; i < end; i++ {
+		e := events[i]
+		ts := "--:--:--"
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, e.Timestamp); parseErr == nil {
+			ts = parsed.Local().Format("15:04:05")
+		}
+		statusText := strings.ToUpper(e.Status)
+		statusColor := green
+		if e.Status != "ok" {
+			statusColor = red
+		}
+		client := activityClientLabel(e)
+		op := strings.TrimSpace(e.Method + " " + e.Target)
+		trace := e.TraceID
+		if len(trace) > 10 {
+			trace = trace[:10]
+		}
+		plain := fmt.Sprintf(" %-8s  %-6s  %-17s  %-32s  %7.1fms  %s", ts, statusText, clipText(client, 17), clipText(op, 32), e.DurationMS, trace)
+		line := fmt.Sprintf(" %s%-8s%s  %s%-6s%s  %-17s  %s%-32s%s  %7.1fms  %s%s%s", dim, ts, reset, statusColor, statusText, reset, clipText(client, 17), cyan, clipText(op, 32), reset, e.DurationMS, dim, trace, reset)
+		if i == selected {
+			line = reverse + clipText(plain, width-1) + reset
+		} else {
+			line = clipText(line, width+48)
+		}
+		b.WriteString(line + "\n")
+	}
+
+	e := events[selected]
+	b.WriteString("\n" + bold + "Selected event" + reset + "\n")
+	fmt.Fprintf(b, "%sOperation:%s %s%s%s    %sLatency:%s %.1fms\n", dim, reset, cyan, strings.TrimSpace(e.Method+" "+e.Target), reset, dim, reset, e.DurationMS)
+	fmt.Fprintf(b, "%sClient:%s %s    %sTrace:%s %s    %sSpan:%s %s\n", dim, reset, activityClientLabel(e), dim, reset, e.TraceID, dim, reset, e.SpanID)
+	b.WriteString("\n" + bold + "Output preview" + reset + " " + dim + "(local-only, max 1.2k chars)" + reset + "\n")
+	preview := strings.TrimSpace(e.OutputPreview)
+	if preview == "" {
+		b.WriteString(dim + "  No textual output preview (empty/binary result or metadata-only call)." + reset + "\n")
+	} else {
+		maxLines := max(2, height-listRows-13)
+		lines := wrapActivityText(preview, max(20, width-4))
+		for i, line := range lines {
+			if i >= maxLines {
+				b.WriteString(dim + "  …" + reset + "\n")
+				break
+			}
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	b.WriteString("\n" + dim + "↑/k older   ↓/j newer   g latest   Enter/q return" + reset + "\n")
+}
+
+func activityClientLabel(e telemetry.ActivityEvent) string {
+	client := strings.TrimSpace(e.ClientName)
+	if client == "" || client == "anonymous" {
+		client = e.ClientKey
+	}
+	if strings.Contains(e.ClientKey, "-session-") {
+		parts := strings.Split(e.ClientKey, "-session-")
+		if len(parts) == 2 && len(parts[1]) >= 6 {
+			client += "/" + parts[1][:min(8, len(parts[1]))]
+		}
+	}
+	return client
+}
+
+func wrapActivityText(s string, width int) []string {
+	if width < 4 {
+		width = 4
+	}
+	var out []string
+	for _, raw := range strings.Split(strings.ReplaceAll(s, "\r", ""), "\n") {
+		if raw == "" {
+			out = append(out, "")
+			continue
+		}
+		r := []rune(raw)
+		for len(r) > width {
+			out = append(out, string(r[:width]))
+			r = r[width:]
+		}
+		out = append(out, string(r))
+	}
+	return out
 }
 
 func clipText(s string, width int) string {

@@ -2,6 +2,8 @@ package process
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,10 +24,11 @@ const (
 )
 
 type Session struct {
-	ID        int       `json:"session_id"`
+	ID        string    `json:"session_id"`
 	Command   string    `json:"command"`
 	StartedAt time.Time `json:"started_at"`
 	TTY       bool      `json:"tty"`
+	Owner     string    `json:"-"`
 
 	mu         sync.Mutex
 	cmd        *exec.Cmd
@@ -42,14 +45,14 @@ type Session struct {
 
 type Manager struct {
 	mu       sync.Mutex
-	nextID   int
-	sessions map[int]*Session
+	sessions map[string]*Session
 }
 
 type StartOptions struct {
 	Command   string
 	Workdir   string
 	TTY       bool
+	Owner     string
 	Yield     time.Duration
 	Timeout   time.Duration
 	MaxOutput int
@@ -57,15 +60,15 @@ type StartOptions struct {
 }
 
 type Result struct {
-	SessionID *int   `json:"session_id,omitempty"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
-	Running   bool   `json:"running"`
-	Output    string `json:"output"`
-	Truncated bool   `json:"truncated,omitempty"`
+	SessionID *string `json:"session_id,omitempty"`
+	ExitCode  *int    `json:"exit_code,omitempty"`
+	Running   bool    `json:"running"`
+	Output    string  `json:"output"`
+	Truncated bool    `json:"truncated,omitempty"`
 }
 
 func NewManager() *Manager {
-	m := &Manager{nextID: 1, sessions: make(map[int]*Session)}
+	m := &Manager{sessions: make(map[string]*Session)}
 	go m.reaper()
 	return m
 }
@@ -116,8 +119,12 @@ func (m *Manager) Start(opts StartOptions) (Result, error) {
 	}
 
 	m.mu.Lock()
-	id := m.nextID
-	m.nextID++
+	id, idErr := newSessionID()
+	if idErr != nil {
+		m.mu.Unlock()
+		_ = killProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+		return Result{}, idErr
+	}
 	s.ID = id
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -223,7 +230,20 @@ func (s *Session) snapshot(advance bool) Result {
 	return res
 }
 
-func (m *Manager) Poll(id int, yield time.Duration) (Result, error) {
+func (s *Session) snapshotFull() Result {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastAccess = time.Now()
+	running := s.exitCode == nil
+	res := Result{ExitCode: s.exitCode, Running: running, Output: string(s.output.Bytes()), Truncated: s.truncated}
+	if running {
+		id := s.ID
+		res.SessionID = &id
+	}
+	return res
+}
+
+func (m *Manager) Poll(id string, yield time.Duration) (Result, error) {
 	s, err := m.get(id)
 	if err != nil {
 		return Result{}, err
@@ -237,7 +257,15 @@ func (m *Manager) Poll(id int, yield time.Duration) (Result, error) {
 	return m.waitResult(s, yield), nil
 }
 
-func (m *Manager) Write(id int, data string, yield time.Duration) (Result, error) {
+func (m *Manager) Full(id string) (Result, error) {
+	s, err := m.get(id)
+	if err != nil {
+		return Result{}, err
+	}
+	return s.snapshotFull(), nil
+}
+
+func (m *Manager) Write(id string, data string, yield time.Duration) (Result, error) {
 	s, err := m.get(id)
 	if err != nil {
 		return Result{}, err
@@ -264,7 +292,7 @@ func (m *Manager) Write(id int, data string, yield time.Duration) (Result, error
 	return m.waitResult(s, yield), nil
 }
 
-func (m *Manager) Kill(id int, sig syscall.Signal) error {
+func (m *Manager) Kill(id string, sig syscall.Signal) error {
 	s, err := m.get(id)
 	if err != nil {
 		return err
@@ -282,14 +310,22 @@ func killProcessGroup(pid int, sig syscall.Signal) error {
 	return nil
 }
 
-func (m *Manager) get(id int) (*Session, error) {
+func (m *Manager) get(id string) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.sessions[id]
 	if s == nil {
-		return nil, fmt.Errorf("unknown session_id %d", id)
+		return nil, fmt.Errorf("unknown session_id %q", id)
 	}
 	return s, nil
+}
+
+func newSessionID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "sess_" + hex.EncodeToString(b), nil
 }
 
 func (m *Manager) reaper() {

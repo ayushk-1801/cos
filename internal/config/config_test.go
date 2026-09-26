@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -125,6 +126,35 @@ func TestVersionOnePortMigratesAwayFromCoS(t *testing.T) {
 	}
 	if cfg.Version != currentConfigVersion || cfg.Listen != "127.0.0.1:8766" {
 		t.Fatalf("v1 migration failed: %+v", cfg)
+	}
+}
+
+func TestV2ConfigMigratesToV3WithoutPluginsPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p := filepath.Join(dir, "cos-lite", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"version":2,"listen":"127.0.0.1:8766","plugins_path":"/tmp/plugins.json","projects":[]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != 3 {
+		t.Fatalf("version=%d", cfg.Version)
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "plugins_path") {
+		t.Fatalf("deprecated plugins_path persisted: %s", b)
 	}
 }
 

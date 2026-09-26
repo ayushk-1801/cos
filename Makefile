@@ -1,6 +1,6 @@
 .PHONY: check-source test build smoke dist release clean
 
-VERSION ?= 0.4.3
+VERSION ?= 0.6.0
 LDFLAGS := -s -w
 
 check-source:
@@ -16,6 +16,7 @@ build:
 smoke: build
 	python3 scripts/e2e.py ./cos
 	python3 scripts/control_plane_e2e.py ./cos
+	python3 scripts/multiclient_e2e.py ./cos
 
 dist:
 	mkdir -p dist

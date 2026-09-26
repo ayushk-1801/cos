@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const currentConfigVersion = 2
+const currentConfigVersion = 3
 
 type Project struct {
 	Name    string `json:"name"`
@@ -37,31 +37,29 @@ type CodeIntel struct {
 }
 
 type Config struct {
-	Version     int       `json:"version"`
-	Listen      string    `json:"listen"`
-	Browser     bool      `json:"browser"`
-	Headless    bool      `json:"headless"`
-	Autostart   bool      `json:"autostart"`
-	PluginsPath string    `json:"plugins_path"`
-	Projects    []Project `json:"projects"`
-	Tunnel      Tunnel    `json:"tunnel"`
-	Skills      Skills    `json:"skills"`
-	CodeIntel   CodeIntel `json:"code_intel"`
+	Version   int       `json:"version"`
+	Listen    string    `json:"listen"`
+	Browser   bool      `json:"browser"`
+	Headless  bool      `json:"headless"`
+	Autostart bool      `json:"autostart"`
+	Projects  []Project `json:"projects"`
+	Tunnel    Tunnel    `json:"tunnel"`
+	Skills    Skills    `json:"skills"`
+	CodeIntel CodeIntel `json:"code_intel"`
 }
 
 var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 func Default() Config {
 	return Config{
-		Version:     currentConfigVersion,
-		Listen:      "127.0.0.1:8766",
-		Browser:     true,
-		Headless:    true,
-		Autostart:   true,
-		PluginsPath: "none",
-		Tunnel:      Tunnel{Provider: "none"},
-		Skills:      Skills{Enabled: true, Global: true, Repo: true},
-		CodeIntel:   CodeIntel{Enabled: true, Overrides: map[string][]string{}},
+		Version:   currentConfigVersion,
+		Listen:    "127.0.0.1:8766",
+		Browser:   true,
+		Headless:  true,
+		Autostart: true,
+		Tunnel:    Tunnel{Provider: "none"},
+		Skills:    Skills{Enabled: true, Global: true, Repo: true},
+		CodeIntel: CodeIntel{Enabled: true, Overrides: map[string][]string{}},
 	}
 }
 
@@ -148,7 +146,12 @@ func (c *Config) Normalize() error {
 		if strings.TrimSpace(c.Listen) == "127.0.0.1:8765" {
 			c.Listen = "127.0.0.1:8766"
 		}
-		c.Version = currentConfigVersion
+		c.Version = 2
+	}
+	// v3 removes the cos-lite-specific external MCP plugins_path setting.
+	// External MCP servers now come exclusively from Codex config.toml.
+	if c.Version < 3 {
+		c.Version = 3
 	}
 	if c.Version > currentConfigVersion {
 		return fmt.Errorf("config version %d is newer than this cos-lite supports (%d)", c.Version, currentConfigVersion)
@@ -158,9 +161,6 @@ func (c *Config) Normalize() error {
 	}
 	if strings.TrimSpace(c.Listen) == "" {
 		c.Listen = "127.0.0.1:8766"
-	}
-	if strings.TrimSpace(c.PluginsPath) == "" {
-		c.PluginsPath = "none"
 	}
 	if strings.TrimSpace(c.Tunnel.Provider) == "" {
 		c.Tunnel.Provider = "none"

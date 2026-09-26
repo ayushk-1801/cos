@@ -25,6 +25,7 @@ import (
 type Client struct {
 	WS        *workspace.Workspace
 	Overrides map[string][]string
+	Pool      *Pool
 }
 
 type Request struct {
@@ -89,13 +90,24 @@ func (c *Client) Run(ctx context.Context, req Request) (Response, error) {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	p, err := startLSP(runCtx, cmdline, root.Path)
-	if err != nil {
-		return Response{}, err
-	}
-	defer p.close()
-	if err := p.initialize(root.Path); err != nil {
-		return Response{}, err
+	var p *lspProc
+	var lease *Lease
+	if c.Pool != nil {
+		lease, err = c.Pool.Acquire(runCtx, root.Path, cmdline)
+		if err != nil {
+			return Response{}, err
+		}
+		defer lease.Release()
+		p = lease.Proc()
+	} else {
+		p, err = startLSP(runCtx, cmdline, root.Path)
+		if err != nil {
+			return Response{}, err
+		}
+		defer p.close()
+		if err := p.initializeContext(runCtx, root.Path); err != nil {
+			return Response{}, err
+		}
 	}
 
 	uri := fileURI(resolved)
@@ -107,7 +119,7 @@ func (c *Client) Run(ctx context.Context, req Request) (Response, error) {
 		if len(b) > 4*1024*1024 {
 			return Response{}, fmt.Errorf("source file exceeds 4 MiB code-intel limit")
 		}
-		if err := p.notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": lang, "version": 1, "text": string(b)}}); err != nil {
+		if err := p.syncDocument(uri, lang, string(b)); err != nil {
 			return Response{}, err
 		}
 	}
@@ -147,7 +159,7 @@ func (c *Client) Run(ctx context.Context, req Request) (Response, error) {
 	default:
 		return Response{}, fmt.Errorf("unsupported code_intel action %q", req.Action)
 	}
-	result, err := p.request(method, params)
+	result, err := p.requestContext(runCtx, method, params)
 	if err != nil && req.Action == "diagnostics" && len(p.diagnostics(uri)) > 0 {
 		result = map[string]any{"kind": "full", "items": p.diagnostics(uri), "source": "textDocument/publishDiagnostics"}
 		err = nil
@@ -240,14 +252,22 @@ func nearestLanguageRoot(path, boundary, lang string) string {
 	if st, err := os.Stat(start); err == nil && !st.IsDir() {
 		start = filepath.Dir(start)
 	}
+	start = filepath.Clean(start)
+	boundary = filepath.Clean(boundary)
 	markers := languageRootMarkers(lang)
-	for dir := filepath.Clean(start); ; dir = filepath.Dir(dir) {
+	gitFallback := ""
+	for dir := start; ; dir = filepath.Dir(dir) {
 		for _, marker := range markers {
 			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
 				return dir
 			}
 		}
-		if dir == filepath.Clean(boundary) {
+		if gitFallback == "" {
+			if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+				gitFallback = dir
+			}
+		}
+		if dir == boundary {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -259,7 +279,13 @@ func nearestLanguageRoot(path, boundary, lang string) string {
 			break
 		}
 	}
-	return filepath.Clean(boundary)
+	if gitFallback != "" {
+		return gitFallback
+	}
+	// Broad approved roots commonly contain several unrelated repositories.
+	// If no language marker or Git boundary exists, keep the LSP scoped to the
+	// file's directory instead of indexing the entire exposed root.
+	return start
 }
 
 func languageRootMarkers(lang string) []string {
@@ -379,6 +405,10 @@ type lspProc struct {
 	mu        sync.Mutex
 	published map[string][]any
 	stderr    bytes.Buffer
+	docs      map[string]int
+	done      chan struct{}
+	waitMu    sync.Mutex
+	waitErr   error
 }
 
 func startLSP(ctx context.Context, argv []string, cwd string) (*lspProc, error) {
@@ -397,11 +427,18 @@ func startLSP(ctx context.Context, argv []string, cwd string) (*lspProc, error) 
 	if err != nil {
 		return nil, err
 	}
-	lp := &lspProc{cmd: cmd, in: in, rd: bufio.NewReader(out), published: map[string][]any{}}
+	lp := &lspProc{cmd: cmd, in: in, rd: bufio.NewReader(out), published: map[string][]any{}, docs: map[string]int{}, done: make(chan struct{})}
 	cmd.Stderr = &limitedBuffer{buf: &lp.stderr, max: 64 * 1024}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	go func() {
+		err := cmd.Wait()
+		lp.waitMu.Lock()
+		lp.waitErr = err
+		lp.waitMu.Unlock()
+		close(lp.done)
+	}()
 	return lp, nil
 }
 func (p *lspProc) close() {
@@ -410,24 +447,80 @@ func (p *lspProc) close() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
 	defer cancel()
-	done := make(chan struct{})
-	go func() { _, _ = p.request("shutdown", nil); _ = p.notify("exit", nil); close(done) }()
+	if p.exited() {
+		return
+	}
+	shutdownDone := make(chan struct{})
+	go func() { _, _ = p.request("shutdown", nil); _ = p.notify("exit", nil); close(shutdownDone) }()
 	select {
-	case <-done:
+	case <-shutdownDone:
 	case <-ctx.Done():
 	}
 	if p.cmd.Process != nil {
 		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 	}
-	_ = p.cmd.Wait()
+	select {
+	case <-p.done:
+	case <-time.After(300 * time.Millisecond):
+	}
 }
-func (p *lspProc) initialize(root string) error {
+func (p *lspProc) initializeContext(ctx context.Context, root string) error {
 	caps := map[string]any{"textDocument": map[string]any{"definition": map[string]any{}, "references": map[string]any{}, "hover": map[string]any{}, "documentSymbol": map[string]any{}, "implementation": map[string]any{}, "rename": map[string]any{}, "diagnostic": map[string]any{}}, "workspace": map[string]any{"symbol": map[string]any{}}}
-	_, err := p.request("initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.4.3"}})
+	_, err := p.requestContext(ctx, "initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.0"}})
 	if err != nil {
 		return err
 	}
 	return p.notify("initialized", map[string]any{})
+}
+
+func (p *lspProc) requestContext(ctx context.Context, method string, params any) (any, error) {
+	type outcome struct {
+		value any
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		v, err := p.request(method, params)
+		done <- outcome{value: v, err: err}
+	}()
+	select {
+	case out := <-done:
+		return out.value, out.err
+	case <-ctx.Done():
+		if p.cmd != nil && p.cmd.Process != nil {
+			_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil, ctx.Err()
+	}
+}
+
+func (p *lspProc) syncDocument(uri, languageID, text string) error {
+	version := p.docs[uri]
+	if version == 0 {
+		version = 1
+		if err := p.notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": languageID, "version": version, "text": text}}); err != nil {
+			return err
+		}
+	} else {
+		version++
+		if err := p.notify("textDocument/didChange", map[string]any{"textDocument": map[string]any{"uri": uri, "version": version}, "contentChanges": []any{map[string]any{"text": text}}}); err != nil {
+			return err
+		}
+	}
+	p.docs[uri] = version
+	return nil
+}
+
+func (p *lspProc) exited() bool {
+	if p == nil || p.done == nil {
+		return true
+	}
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 func (p *lspProc) request(method string, params any) (any, error) {
 	p.mu.Lock()

@@ -36,13 +36,13 @@ func (e *Executor) StdinDefinition() Tool {
 		Name: "write_stdin", Title: "Interact with running command",
 		Description: "Write characters to a running exec_command session or poll it for new output. Sending the single control character \\u0003 delivers SIGINT to the whole process group.",
 		InputSchema: map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
-			"session_id": map[string]any{"type": "integer", "minimum": 1}, "chars": map[string]any{"type": "string"}, "yield_time_ms": map[string]any{"type": "integer", "minimum": 0, "maximum": 30000, "default": 250},
+			"session_id": map[string]any{"type": "string", "pattern": "^sess_[0-9a-f]{32}$", "description": "Opaque session handle returned by exec_command."}, "chars": map[string]any{"type": "string"}, "yield_time_ms": map[string]any{"type": "integer", "minimum": 0, "maximum": 30000, "default": 250},
 		}, "required": []string{"session_id"}},
 		Annotations: map[string]any{"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
 	}, Handler: e.HandleStdin}
 }
 
-func (e *Executor) HandleExec(_ context.Context, args map[string]any) (Result, error) {
+func (e *Executor) HandleExec(ctx context.Context, args map[string]any) (Result, error) {
 	cmd := strArg(args, "cmd")
 	if arr := stringSliceArg(args, "cmds"); len(arr) > 0 {
 		if cmd != "" {
@@ -75,9 +75,9 @@ func (e *Executor) HandleExec(_ context.Context, args map[string]any) (Result, e
 	return Result{Content: []Content{{"type": "text", "text": text}}, Structured: res}, nil
 }
 
-func (e *Executor) HandleStdin(_ context.Context, args map[string]any) (Result, error) {
-	id := intArg(args, "session_id", 0)
-	if id <= 0 {
+func (e *Executor) HandleStdin(ctx context.Context, args map[string]any) (Result, error) {
+	id := strArg(args, "session_id")
+	if !strings.HasPrefix(id, "sess_") {
 		return Error("valid session_id is required"), nil
 	}
 	yield := time.Duration(intArg(args, "yield_time_ms", 250)) * time.Millisecond
@@ -102,7 +102,7 @@ func (e *Executor) HandleStdin(_ context.Context, args map[string]any) (Result, 
 func formatProcessResult(r proc.Result) string {
 	var b strings.Builder
 	if r.SessionID != nil {
-		fmt.Fprintf(&b, "session_id: %d\n", *r.SessionID)
+		fmt.Fprintf(&b, "session_id: %s\n", *r.SessionID)
 	}
 	if r.ExitCode != nil {
 		fmt.Fprintf(&b, "exit_code: %d\n", *r.ExitCode)

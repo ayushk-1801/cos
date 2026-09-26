@@ -3,10 +3,32 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestFindPluginExecutableSearchesVitePlusBin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	p := filepath.Join(home, ".vite-plus", "bin", "npx")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := findPluginExecutable("npx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != p {
+		t.Fatalf("got %q want %q", got, p)
+	}
+}
 
 func TestPluginDiscoveryAndCall(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {

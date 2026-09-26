@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ayush/cos-lite/internal/workspace"
 )
@@ -50,6 +51,39 @@ func TestNearestLanguageRootInsideBroadWorkspace(t *testing.T) {
 	}
 	if got := nearestLanguageRoot(file, root, "go"); got != repo {
 		t.Fatalf("got %q, want %q", got, repo)
+	}
+}
+
+func TestNearestLanguageRootFallsBackToGitRepo(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "nested", "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(repo, "pkg", "x.go")
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := nearestLanguageRoot(file, root, "go"); got != repo {
+		t.Fatalf("got %q, want git repo %q", got, repo)
+	}
+}
+
+func TestNearestLanguageRootFallsBackToFileDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "x.go")
+	if err := os.WriteFile(file, []byte("package scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := nearestLanguageRoot(file, root, "go"); got != dir {
+		t.Fatalf("got %q, want file directory %q", got, dir)
 	}
 }
 
@@ -114,6 +148,66 @@ func TestDefinitionWithFakeLSP(t *testing.T) {
 	}
 }
 
+func TestPoolReusesLSPAndRefreshesDocument(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "main.go")
+	if err := os.WriteFile(file, []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := workspace.NewRoots([]workspace.Root{{Name: "proj", Path: root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initFile := filepath.Join(t.TempDir(), "initializes.txt")
+	t.Setenv("COS_LSP_TEST_INIT_FILE", initFile)
+	pool := NewPool(time.Minute)
+	defer pool.Close()
+	c := &Client{WS: ws, Pool: pool, Overrides: map[string][]string{"go": {os.Args[0], "-test.run=TestLSPHelperProcess", "--", "--lsp-helper"}}}
+	for i := 0; i < 2; i++ {
+		if i == 1 {
+			if err := os.WriteFile(file, []byte("package main\nfunc main() { println(1) }\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := c.Run(context.Background(), Request{Action: "definition", Path: "/proj/main.go", Line: 2, Column: 6}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(initFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(b), "initialize\n"); got != 1 {
+		t.Fatalf("LSP initialized %d times, want 1; file=%q", got, string(b))
+	}
+	if pool.Size() != 1 {
+		t.Fatalf("pool size=%d, want 1", pool.Size())
+	}
+}
+
+func TestPoolEvictsIdleLSP(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "main.go")
+	if err := os.WriteFile(file, []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, _ := workspace.NewRoots([]workspace.Root{{Name: "proj", Path: root}})
+	pool := NewPool(80 * time.Millisecond)
+	defer pool.Close()
+	c := &Client{WS: ws, Pool: pool, Overrides: map[string][]string{"go": {os.Args[0], "-test.run=TestLSPHelperProcess", "--", "--lsp-helper"}}}
+	if _, err := c.Run(context.Background(), Request{Action: "definition", Path: "/proj/main.go", Line: 2, Column: 6}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pool.Size() == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("idle LSP was not evicted, pool size=%d", pool.Size())
+}
+
 func TestLSPHelperProcess(t *testing.T) {
 	marked := false
 	for _, a := range os.Args {
@@ -147,6 +241,13 @@ func TestLSPHelperProcess(t *testing.T) {
 		var result any = map[string]any{}
 		switch method {
 		case "initialize":
+			if p := os.Getenv("COS_LSP_TEST_INIT_FILE"); p != "" {
+				f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+				if err == nil {
+					_, _ = f.WriteString("initialize\n")
+					_ = f.Close()
+				}
+			}
 			result = map[string]any{"capabilities": map[string]any{"definitionProvider": true}}
 		case "textDocument/definition":
 			cwd, _ := os.Getwd()

@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ayush/cos-lite/internal/workspace"
 )
@@ -37,6 +39,12 @@ type Library struct {
 	WS     *workspace.Workspace
 	Global bool
 	Repo   bool
+
+	mu         sync.Mutex
+	cacheUntil time.Time
+	cacheList  []Skill
+	cacheErrs  []string
+	cacheTTL   time.Duration
 }
 
 func GlobalDir() (string, error) {
@@ -48,6 +56,19 @@ func GlobalDir() (string, error) {
 }
 
 func (l *Library) List() ([]Skill, []string) {
+	if l == nil {
+		return nil, []string{"skills library is nil"}
+	}
+	now := time.Now()
+	l.mu.Lock()
+	if now.Before(l.cacheUntil) {
+		list := append([]Skill(nil), l.cacheList...)
+		errs := append([]string(nil), l.cacheErrs...)
+		l.mu.Unlock()
+		return list, errs
+	}
+	l.mu.Unlock()
+
 	var out []Skill
 	var errs []string
 	if l.Global {
@@ -96,7 +117,16 @@ func (l *Library) List() ([]Skill, []string) {
 		}
 		return out[i].ID < out[j].ID
 	})
-	return out, errs
+	l.mu.Lock()
+	l.cacheList = append([]Skill(nil), out...)
+	l.cacheErrs = append([]string(nil), errs...)
+	ttl := l.cacheTTL
+	if ttl <= 0 {
+		ttl = 2 * time.Second
+	}
+	l.cacheUntil = time.Now().Add(ttl)
+	l.mu.Unlock()
+	return append([]Skill(nil), out...), append([]string(nil), errs...)
 }
 
 func (l *Library) CatalogText() string {

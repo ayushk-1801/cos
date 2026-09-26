@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,16 +29,25 @@ type Tab struct {
 }
 
 type Manager struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	base     string
-	profile  string
-	sessions map[string]*cdpSession
-	headless bool
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	base       string
+	profile    string
+	sessions   map[string]*cdpSession
+	headless   bool
+	profileKey string
 }
 
 func NewManager(headless bool) *Manager {
-	return &Manager{sessions: make(map[string]*cdpSession), headless: headless}
+	return NewManagerForClient(headless, "shared")
+}
+
+func NewManagerForClient(headless bool, key string) *Manager {
+	if strings.TrimSpace(key) == "" {
+		key = "anonymous"
+	}
+	sum := sha256.Sum256([]byte(key))
+	return &Manager{sessions: make(map[string]*cdpSession), headless: headless, profileKey: fmt.Sprintf("%x", sum[:8])}
 }
 
 func (m *Manager) Ensure(ctx context.Context) error {
@@ -72,7 +82,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	if err != nil {
 		cache = os.TempDir()
 	}
-	profile := filepath.Join(cache, "cos-lite", "chromium-profile")
+	profile := filepath.Join(cache, "cos-lite", "chromium-profiles", m.profileKey)
 	if err := os.MkdirAll(profile, 0o700); err != nil {
 		return err
 	}

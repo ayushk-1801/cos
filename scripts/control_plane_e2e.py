@@ -13,21 +13,65 @@ def call(url,i,name,args):
     req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json','Accept':'application/json','MCP-Protocol-Version':P,'Mcp-Method':'tools/call','Mcp-Name':name},method='POST')
     return json.load(urllib.request.urlopen(req,timeout=10))['result']
 
+def tool_names(url):
+    params={'_meta':{'io.modelcontextprotocol/protocolVersion':P,'io.modelcontextprotocol/clientInfo':{'name':'control-e2e','version':'1'},'io.modelcontextprotocol/clientCapabilities':{}}}
+    body=json.dumps({'jsonrpc':'2.0','id':99,'method':'tools/list','params':params}).encode()
+    req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json','Accept':'application/json','MCP-Protocol-Version':P,'Mcp-Method':'tools/list'},method='POST')
+    return [t['name'] for t in json.load(urllib.request.urlopen(req,timeout=10))['result']['tools']]
+
 with tempfile.TemporaryDirectory() as td:
-    td=pathlib.Path(td); home=td/'home'; cfgd=td/'config'; stated=td/'state'; home.mkdir();cfgd.mkdir();stated.mkdir()
+    td=pathlib.Path(td); home=td/'home'; cfgd=td/'config'; stated=td/'state'; codex=td/'codex'; home.mkdir();cfgd.mkdir();stated.mkdir();codex.mkdir()
     p1=td/'alpha';p2=td/'beta';p1.mkdir();p2.mkdir();(p1/'a.txt').write_text('alpha\n');(p2/'b.txt').write_text('beta\n')
-    env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(cfgd),XDG_STATE_HOME=str(stated),COS_DISABLE_SYSTEMD='1')
+    env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(cfgd),XDG_STATE_HOME=str(stated),CODEX_HOME=str(codex),COS_DISABLE_SYSTEMD='1')
     # Reserve no fixed host port in the integration test. This still exercises
     # automatic first-project startup, but cannot collide with another local app.
     run(env,'service','enable')
     config_path=cfgd/'cos-lite'/'config.json'; cfg=json.loads(config_path.read_text());cfg['listen']='127.0.0.1:0';cfg['browser']=False;config_path.write_text(json.dumps(cfg,indent=2)+'\n')
     run(env,'project','add',str(p1),'alpha')
     auto=run(env,'status').stdout; assert 'daemon: running' in auto and 'projects: alpha' in auto,auto
+    sp=stated/'cos-lite'/'state.json'; initial_state=json.loads(sp.read_text()); daemon_pid=initial_state['pid']
     run(env,'project','add',str(p2),'beta')
+    deadline=time.time()+4
+    while time.time()<deadline:
+        state=json.loads(sp.read_text())
+        if state.get('projects')==['alpha','beta']: break
+        time.sleep(.05)
+    assert state['projects']==['alpha','beta'],state
+    assert state['pid']==daemon_pid,('project add restarted daemon',daemon_pid,state)
+
+    fake=td/'fake_mcp.py'
+    fake.write_text("""import json,sys
+for line in sys.stdin:
+ msg=json.loads(line); rid=msg.get('id'); method=msg.get('method')
+ if rid is None: continue
+ if method=='server/discover': result={'resultType':'complete','supportedVersions':['2026-07-28'],'capabilities':{'tools':{}},'ttlMs':1000,'cacheScope':'public'}
+ elif method=='tools/list': result={'resultType':'complete','tools':[{'name':'echo','description':'echo','inputSchema':{'type':'object','properties':{}}}],'ttlMs':1000,'cacheScope':'public'}
+ elif method=='tools/call': result={'resultType':'complete','content':[{'type':'text','text':'ok'}]}
+ else:
+  print(json.dumps({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'unsupported'}}),flush=True); continue
+ print(json.dumps({'jsonrpc':'2.0','id':rid,'result':result}),flush=True)
+""")
+    codex_cfg=codex/'config.toml'
+    codex_cfg.write_text('[mcp_servers.fake]\ncommand = '+json.dumps(os.sys.executable)+'\nargs = ["-u", '+json.dumps(str(fake))+']\n')
+    deadline=time.time()+5
+    while time.time()<deadline:
+        state=json.loads(sp.read_text())
+        if 'fake.echo' in tool_names(state['endpoint']): break
+        time.sleep(.05)
+    else: raise AssertionError('Codex MCP config hot reload did not add fake.echo')
+    assert state['pid']==daemon_pid,('Codex MCP add restarted daemon',daemon_pid,state)
+    codex_cfg.write_text('')
+    deadline=time.time()+5
+    while time.time()<deadline:
+        state=json.loads(sp.read_text())
+        if 'fake.echo' not in tool_names(state['endpoint']): break
+        time.sleep(.05)
+    else: raise AssertionError('Codex MCP config hot reload did not remove fake.echo')
+    assert state['pid']==daemon_pid,('Codex MCP remove restarted daemon',daemon_pid,state)
+
     cfg=json.loads(config_path.read_text());cfg['tunnel']={'provider':'custom','command':"echo ready https://control.example.test; sleep 20"};config_path.write_text(json.dumps(cfg,indent=2)+'\n')
-    run(env,'restart')
     try:
-        sp=stated/'cos-lite'/'state.json';deadline=time.time()+5
+        deadline=time.time()+5
         while time.time()<deadline:
             if sp.exists():
                 state=json.loads(sp.read_text())
@@ -35,6 +79,7 @@ with tempfile.TemporaryDirectory() as td:
             time.sleep(.05)
         else: raise AssertionError('state/public tunnel URL not ready')
         assert state['projects']==['alpha','beta'],state
+        assert state['pid']==daemon_pid,('tunnel config hot reload restarted daemon',daemon_pid,state)
         assert state['public_url'].endswith('/mcp/'+state['endpoint'].rsplit('/',1)[1]),state
         assert 'alpha' in call(state['endpoint'],1,'read',{'path':'/alpha/a.txt'})['content'][0]['text']
         assert 'beta' in call(state['endpoint'],2,'read',{'path':'/beta/b.txt'})['content'][0]['text']
@@ -46,6 +91,7 @@ with tempfile.TemporaryDirectory() as td:
             if state.get('projects')==['alpha'] and state.get('public_url'): break
             time.sleep(.05)
         assert state['projects']==['alpha'],state
+        assert state['pid']==daemon_pid,('project disable restarted daemon',daemon_pid,state)
         assert state.get('public_url'),state
         out=run(env,'status').stdout;assert 'projects: alpha' in out,out
         endpoint=run(env,'endpoint').stdout.strip();assert endpoint.startswith('https://control.example.test/mcp/'),endpoint

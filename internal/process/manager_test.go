@@ -55,3 +55,28 @@ func TestBackgroundAndWriteStdin(t *testing.T) {
 		t.Fatalf("output=%q", res2.Output)
 	}
 }
+
+func TestOpaqueSessionCapability(t *testing.T) {
+	m := NewManager()
+	res, err := m.Start(StartOptions{Command: "read x; echo got:$x", Workdir: t.TempDir(), Yield: 50 * time.Millisecond, Env: SanitizedEnv()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SessionID == nil {
+		t.Fatalf("expected session: %+v", res)
+	}
+	id := *res.SessionID
+	if !strings.HasPrefix(id, "sess_") || len(id) != len("sess_")+32 {
+		t.Fatalf("session handle is not opaque: %q", id)
+	}
+	if _, err := m.Poll("sess_00000000000000000000000000000000", 0); err == nil {
+		t.Fatal("unknown capability handle unexpectedly resolved")
+	}
+	res2, err := m.Write(id, "abc\n", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res2.Output, "got:abc") {
+		t.Fatalf("output=%q", res2.Output)
+	}
+}

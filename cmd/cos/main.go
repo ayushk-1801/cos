@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,22 +25,27 @@ import (
 
 	"github.com/ayush/cos-lite/internal/app"
 	"github.com/ayush/cos-lite/internal/browser"
+	"github.com/ayush/cos-lite/internal/clientctx"
 	"github.com/ayush/cos-lite/internal/codeintel"
 	"github.com/ayush/cos-lite/internal/config"
 	"github.com/ayush/cos-lite/internal/control"
+	"github.com/ayush/cos-lite/internal/instructions"
 	"github.com/ayush/cos-lite/internal/mcp"
 	planpkg "github.com/ayush/cos-lite/internal/plan"
 	"github.com/ayush/cos-lite/internal/plugins"
 	proc "github.com/ayush/cos-lite/internal/process"
+	resourcepkg "github.com/ayush/cos-lite/internal/resources"
 	"github.com/ayush/cos-lite/internal/service"
 	skillpkg "github.com/ayush/cos-lite/internal/skills"
+	taskpkg "github.com/ayush/cos-lite/internal/tasks"
+	"github.com/ayush/cos-lite/internal/telemetry"
 	"github.com/ayush/cos-lite/internal/tools"
 	"github.com/ayush/cos-lite/internal/tui"
 	tunnelpkg "github.com/ayush/cos-lite/internal/tunnel"
 	"github.com/ayush/cos-lite/internal/workspace"
 )
 
-const version = "0.4.3"
+const version = "0.6.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -91,6 +97,8 @@ func run(args []string) error {
 		return printEndpoint()
 	case "logs":
 		return printLogs(args[1:])
+	case "audit":
+		return printAudit(args[1:])
 	case "project":
 		return projectCommand(binary, args[1:])
 	case "skill":
@@ -131,6 +139,7 @@ Usage:
   cos tunnel key-from-file PATH
   cos service enable|disable|status
   cos logs [--raw] [LINES]
+  cos audit [--json] [LINES]
   cos doctor
   cos serve [flags] [PATH]    One-off MCP server (stdio or HTTP)
 `)
@@ -196,6 +205,17 @@ func doctor() error {
 	showLSP("Rust LSP", "rust", "rust-analyzer")
 	showLSP("Python LSP", "python", "basedpyright-langserver or pyright-langserver")
 	showLSP("TS/JS LSP", "typescript", "typescript-language-server")
+	if p, err := telemetry.AuditPath(); err == nil {
+		fmt.Printf("[info] %-12s %s\n", "audit", p)
+	}
+	if p, err := telemetry.ActivityPath(); err == nil {
+		fmt.Printf("[info] %-12s %s\n", "activity", p)
+	}
+	if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint != "" {
+		fmt.Printf("[ok] %-12s %s\n", "OTLP traces", endpoint)
+	} else {
+		fmt.Println("[info] OTLP tracing disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
+	}
 	cfg, _ := config.Load()
 	fmt.Printf("[info] autostart policy=%v; linger=%v\n", cfg.Autostart, service.LingerEnabled())
 	if missingRequired {
@@ -315,6 +335,77 @@ func printLogs(args []string) error {
 	}
 	fmt.Println(text)
 	return nil
+}
+
+func printAudit(args []string) error {
+	lines := 100
+	jsonMode := false
+	var positional []string
+	for _, arg := range args {
+		if arg == "--json" {
+			jsonMode = true
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	if len(positional) > 1 {
+		return errors.New("usage: cos audit [--json] [LINES]")
+	}
+	if len(positional) == 1 {
+		n, err := strconv.Atoi(positional[0])
+		if err != nil || n < 1 {
+			return errors.New("LINES must be a positive integer")
+		}
+		lines = n
+	}
+	events, err := telemetry.ReadAudit(lines)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		fmt.Println("No MCP audit events yet.")
+		return nil
+	}
+	if jsonMode {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(events)
+	}
+	for _, e := range events {
+		ts := e.Timestamp
+		if parsed, err := time.Parse(time.RFC3339Nano, e.Timestamp); err == nil {
+			ts = parsed.Local().Format("15:04:05")
+		}
+		target := e.Target
+		if target == "" {
+			target = "-"
+		}
+		client := e.ClientName
+		if client == "" {
+			client = e.ClientKey
+		} else if suffix := clientKeySuffix(e.ClientKey); suffix != "" {
+			client += "/" + suffix
+		}
+		fmt.Printf("%s  %-7s  %-14s  %-30s  %7.1fms  %s\n", ts, e.Status, client, e.Method+" "+target, e.DurationMS, shortTrace(e.TraceID))
+	}
+	return nil
+}
+
+func shortTrace(v string) string {
+	if len(v) > 12 {
+		return v[:12]
+	}
+	return v
+}
+
+func clientKeySuffix(v string) string {
+	if i := strings.LastIndex(v, "-"); i >= 0 && len(v)-i-1 >= 6 {
+		v = v[i+1:]
+	}
+	if len(v) > 8 {
+		return v[:8]
+	}
+	return v
 }
 
 func projectCommand(binary string, args []string) error {
@@ -628,14 +719,21 @@ type serveOptions struct {
 	allowRemote bool
 	browser     bool
 	headless    bool
-	plugins     string
 	skills      bool
 	codeIntel   bool
 }
 
+type serveRuntime struct {
+	registry     *tools.Registry
+	resources    *resourcepkg.Provider
+	tasks        *taskpkg.Manager
+	telemetry    *telemetry.Recorder
+	instructions func(context.Context) string
+	cleanup      func()
+}
+
 func runServe(args []string) error {
 	defaults := config.Default()
-	pluginDefault := plugins.DefaultConfigPath()
 	fs := flag.NewFlagSet("cos serve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	opts := serveOptions{}
@@ -645,7 +743,6 @@ func runServe(args []string) error {
 	fs.BoolVar(&opts.allowRemote, "allow-remote", false, "allow a non-loopback HTTP bind; prefer a tunnel")
 	fs.BoolVar(&opts.browser, "browser", true, "expose generic Chromium CDP tools")
 	fs.BoolVar(&opts.headless, "headless", true, "launch Chromium headless when first used")
-	fs.StringVar(&opts.plugins, "plugins", pluginDefault, "plugin config JSON path, or none")
 	fs.BoolVar(&opts.skills, "skills", true, "expose global and repo-local skills")
 	fs.BoolVar(&opts.codeIntel, "code-intel", true, "expose semantic code intelligence through installed LSPs")
 	if err := fs.Parse(args); err != nil {
@@ -664,14 +761,16 @@ func runServe(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	reg, cleanup, instructions, err := buildRegistry(ctx, ws, opts)
+	rt, err := buildRegistry(ctx, ws, opts)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
-	srv := mcp.New(reg)
+	defer rt.cleanup()
+	srv := mcp.New(rt.registry)
 	srv.Version = version
-	srv.Instructions = instructions
+	srv.Tasks = rt.tasks
+	srv.Telemetry = rt.telemetry
+	srv.Update(rt.registry, rt.resources, rt.instructions)
 	if opts.transport == "stdio" {
 		return srv.ServeStdio(ctx, os.Stdin, os.Stdout)
 	}
@@ -709,7 +808,7 @@ func runServe(args []string) error {
 	return err
 }
 
-func buildRegistry(ctx context.Context, ws *workspace.Workspace, opts serveOptions) (*tools.Registry, func(), string, error) {
+func buildRegistry(ctx context.Context, ws *workspace.Workspace, opts serveOptions) (*serveRuntime, error) {
 	reg := tools.NewRegistry()
 	register := func(t tools.Tool) error { return reg.Register(t) }
 	for _, t := range []tools.Tool{
@@ -719,72 +818,111 @@ func buildRegistry(ctx context.Context, ws *workspace.Workspace, opts serveOptio
 		(&tools.Patcher{WS: ws}).Definition(),
 	} {
 		if err := register(t); err != nil {
-			return nil, nil, "", err
+			return nil, err
 		}
 	}
 	pm := proc.NewManager()
+	taskManager := taskpkg.NewManager(pm)
 	executor := &tools.Executor{WS: ws, PM: pm}
 	if err := register(executor.ExecDefinition()); err != nil {
-		return nil, nil, "", err
+		return nil, err
 	}
 	if err := register(executor.StdinDefinition()); err != nil {
-		return nil, nil, "", err
+		return nil, err
 	}
 	if err := register((&tools.Planner{Store: &planpkg.Store{}}).Definition()); err != nil {
-		return nil, nil, "", err
+		return nil, err
 	}
 	skillLib := &skillpkg.Library{WS: ws, Global: true, Repo: true}
 	if opts.skills {
 		if err := register((&tools.SkillsTool{Library: skillLib}).Definition()); err != nil {
-			return nil, nil, "", err
+			return nil, err
 		}
 	}
+	var lspPool *codeintel.Pool
 	if opts.codeIntel {
-		if err := register((&tools.CodeIntel{Client: &codeintel.Client{WS: ws}}).Definition()); err != nil {
-			return nil, nil, "", err
+		lspPool = codeintel.NewPool(codeintel.DefaultPoolIdleTTL)
+		if err := register((&tools.CodeIntel{Client: &codeintel.Client{WS: ws, Pool: lspPool}}).Definition()); err != nil {
+			lspPool.Close()
+			return nil, err
 		}
 	}
 	pluginManager := &plugins.Manager{}
-	pluginCfg, err := plugins.LoadConfig(opts.plugins)
+	pluginCfg, pluginWarnings, err := plugins.LoadCodexConfig()
 	if err != nil {
-		return nil, nil, "", err
+		if lspPool != nil {
+			lspPool.Close()
+		}
+		return nil, err
+	}
+	for _, warning := range pluginWarnings {
+		fmt.Fprintln(os.Stderr, "cos-lite:", warning)
 	}
 	if len(pluginCfg) > 0 {
-		if err := pluginManager.Register(ctx, reg, pluginCfg); err != nil {
-			return nil, nil, "", err
+		for _, warning := range pluginManager.Register(ctx, reg, pluginCfg) {
+			fmt.Fprintln(os.Stderr, "cos-lite:", warning)
 		}
 	}
-	var bm *browser.Manager
+	var browserPool *browser.Pool
 	if opts.browser {
-		bm = browser.NewManager(opts.headless)
-		for _, t := range (&tools.BrowserTools{Browser: bm}).Definitions() {
+		browserPool = browser.NewPool(opts.headless)
+		for _, t := range (&tools.BrowserTools{Pool: browserPool}).Definitions() {
 			if err := register(t); err != nil {
 				pluginManager.Close()
-				return nil, nil, "", err
+				browserPool.Shutdown()
+				return nil, err
 			}
 		}
 	}
 	if err := register((&tools.ExecMode{Registry: reg}).Definition()); err != nil {
 		pluginManager.Close()
-		if bm != nil {
-			bm.Shutdown()
+		if browserPool != nil {
+			browserPool.Shutdown()
 		}
-		return nil, nil, "", err
+		return nil, err
+	}
+	recorder, err := telemetry.New()
+	if err != nil {
+		pluginManager.Close()
+		if browserPool != nil {
+			browserPool.Shutdown()
+		}
+		return nil, err
+	}
+	resolver := &instructions.Resolver{WS: ws}
+	resources := &resourcepkg.Provider{
+		WS: ws, Skills: skillLib, Instructions: resolver,
+		Status: func(reqCtx context.Context) any {
+			info := clientctx.From(reqCtx)
+			return map[string]any{"version": version, "workspace": ws.RootSummary(), "client": map[string]any{"key": info.Key, "name": info.Name, "version": info.Version}}
+		},
+		Audit: func(reqCtx context.Context) any { return recorder.Recent(clientctx.Key(reqCtx), 100) },
 	}
 	cleanup := func() {
 		pluginManager.Close()
-		if bm != nil {
-			bm.Shutdown()
+		if lspPool != nil {
+			lspPool.Close()
 		}
+		if browserPool != nil {
+			browserPool.Shutdown()
+		}
+		_ = recorder.Close()
 	}
-	instructions := "Ubuntu-first local coding tools. Approved project roots: " + ws.RootSummary() + "."
-	if opts.skills {
-		instructions += "\n\n# Skills\nUse the skills tool to load a workflow only when relevant. Skills never grant extra permissions.\n" + skillLib.CatalogText()
+	instructionProvider := func(context.Context) string {
+		text := "Ubuntu-first local coding tools. Approved project roots: " + ws.RootSummary() + "."
+		if agents := resolver.ServerText(); agents != "" {
+			text += "\n\n# Project instructions (AGENTS.md)\n" + agents
+		}
+		if opts.skills {
+			text += "\n\n# Skills\nUse the skills tool to load a workflow only when relevant. Skills never grant extra permissions.\n" + skillLib.CatalogText()
+		}
+		if opts.codeIntel {
+			text += "\n\n# Code intelligence\nPrefer code_intel for semantic definitions, references, types, diagnostics and rename previews; use find/rg for textual search."
+		}
+		text += "\n\n# Resources\nUse MCP Resources for project/Git/instruction/Skill/audit context."
+		return text
 	}
-	if opts.codeIntel {
-		instructions += "\n\n# Code intelligence\nPrefer code_intel for semantic definitions, references, types, diagnostics and rename previews; use find/rg for textual search."
-	}
-	return reg, cleanup, instructions, nil
+	return &serveRuntime{registry: reg, resources: resources, tasks: taskManager, telemetry: recorder, instructions: instructionProvider, cleanup: cleanup}, nil
 }
 
 func loopbackListen(addr string) bool {

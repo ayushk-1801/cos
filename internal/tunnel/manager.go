@@ -34,6 +34,29 @@ type Manager struct {
 	status     Status
 	cancel     context.CancelFunc
 	healthFile string
+	changes    chan struct{}
+}
+
+func (m *Manager) Changes() <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.changes == nil {
+		m.changes = make(chan struct{}, 1)
+	}
+	return m.changes
+}
+
+func (m *Manager) signalChange() {
+	m.mu.RLock()
+	ch := m.changes
+	m.mu.RUnlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Manager) Start(parent context.Context, cfg config.Tunnel, localEndpoint string) error {
@@ -41,6 +64,7 @@ func (m *Manager) Start(parent context.Context, cfg config.Tunnel, localEndpoint
 	m.mu.Lock()
 	m.status = Status{Provider: cfg.Provider}
 	m.mu.Unlock()
+	m.signalChange()
 	fail := func(err error) error { m.setError(err.Error()); return err }
 	if cfg.Provider == "" || cfg.Provider == "none" {
 		return nil
@@ -113,6 +137,7 @@ func (m *Manager) Start(parent context.Context, cfg config.Tunnel, localEndpoint
 	m.cmd = cmd
 	m.status.Running = true
 	m.mu.Unlock()
+	m.signalChange()
 	go m.consume(stdout, localEndpoint, capturePublicURL)
 	go m.consume(stderr, localEndpoint, capturePublicURL)
 	if cfg.Provider == "openai" {
@@ -129,6 +154,7 @@ func (m *Manager) Start(parent context.Context, cfg config.Tunnel, localEndpoint
 			m.status.Error = err.Error()
 		}
 		m.mu.Unlock()
+		m.signalChange()
 		if err != nil && ctx.Err() == nil {
 			log.Printf("tunnel exited: %v", err)
 		}
@@ -156,6 +182,7 @@ func (m *Manager) consume(r io.Reader, localEndpoint string, capturePublicURL bo
 					m.status.PublicURL = strings.TrimRight(u, "/") + parsed.Path
 				}
 				m.mu.Unlock()
+				m.signalChange()
 			}
 		}
 	}
@@ -191,6 +218,7 @@ func (m *Manager) watchOpenAIReady(ctx context.Context, path string) {
 				m.mu.Lock()
 				m.status.Ready = true
 				m.mu.Unlock()
+				m.signalChange()
 				return
 			}
 		}
@@ -198,7 +226,7 @@ func (m *Manager) watchOpenAIReady(ctx context.Context, path string) {
 }
 
 func (m *Manager) watchOpenAICollision(ctx context.Context, tunnelID string) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -219,6 +247,7 @@ func (m *Manager) watchOpenAICollision(ctx context.Context, tunnelID string) {
 			m.status.Error = msg
 			m.status.Ready = false
 			m.mu.Unlock()
+			m.signalChange()
 			log.Printf("tunnel collision: %s", msg)
 			if cmd != nil && cmd.Process != nil {
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
@@ -229,10 +258,11 @@ func (m *Manager) watchOpenAICollision(ctx context.Context, tunnelID string) {
 }
 func (m *Manager) setError(s string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.status.Error = s
 	m.status.Running = false
 	m.status.Ready = false
+	m.mu.Unlock()
+	m.signalChange()
 }
 func (m *Manager) Status() Status { m.mu.RLock(); defer m.mu.RUnlock(); return m.status }
 func (m *Manager) Stop() {
@@ -246,6 +276,7 @@ func (m *Manager) Stop() {
 	healthFile := m.healthFile
 	m.healthFile = ""
 	m.mu.Unlock()
+	m.signalChange()
 	if cancel != nil {
 		cancel()
 	}

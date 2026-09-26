@@ -7,17 +7,26 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 type Config struct {
-	Name    string   `json:"name"`
-	Command []string `json:"command"`
-	Prefix  string   `json:"prefix,omitempty"`
+	Name           string
+	Command        []string
+	Env            map[string]string
+	EnvVars        []string
+	CWD            string
+	StartupTimeout time.Duration
+	ToolTimeout    time.Duration
+	Prefix         string
 }
 
 type Client struct {
@@ -53,7 +62,39 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Name == "" || len(cfg.Command) == 0 {
 		return nil, fmt.Errorf("plugin name and command are required")
 	}
-	cmd := exec.CommandContext(ctx, cfg.Command[0], cfg.Command[1:]...)
+	binary, err := findPluginExecutable(cfg.Command[0])
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", cfg.Command[0], err)
+	}
+	cmd := exec.CommandContext(ctx, binary, cfg.Command[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cfg.CWD != "" {
+		cmd.Dir = cfg.CWD
+	}
+	envMap := map[string]string{}
+	for _, item := range os.Environ() {
+		if key, value, ok := strings.Cut(item, "="); ok {
+			envMap[key] = value
+		}
+	}
+	for _, name := range cfg.EnvVars {
+		if value, ok := os.LookupEnv(name); ok {
+			envMap[name] = value
+		}
+	}
+	for key, value := range cfg.Env {
+		envMap[key] = value
+	}
+	keys := make([]string, 0, len(envMap))
+	for key := range envMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+envMap[key])
+	}
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -81,11 +122,57 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	return c, nil
 }
 
+func findPluginExecutable(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", exec.ErrNotFound
+	}
+	if filepath.IsAbs(name) {
+		st, err := os.Stat(name)
+		if err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return name, nil
+		}
+		return "", exec.ErrNotFound
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", exec.ErrNotFound
+	}
+	for _, dir := range []string{
+		filepath.Join(home, ".vite-plus", "bin"),
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "bin"),
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".cargo", "bin"),
+	} {
+		candidate := filepath.Join(dir, name)
+		if st, statErr := os.Stat(candidate); statErr == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
 func (c *Client) Close() {
 	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
+		_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGTERM)
 	}
 	c.failAll(fmt.Errorf("plugin closed"))
+}
+
+func (c *Client) Closed() bool {
+	if c == nil {
+		return true
+	}
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
 }
 func (c *Client) Prefix() string {
 	if c.cfg.Prefix != "" {
@@ -157,10 +244,23 @@ func (c *Client) request(ctx context.Context, method string, params any) (json.R
 	case <-ctx.Done():
 		c.remove(id)
 		return nil, nil, ctx.Err()
-	case <-time.After(30 * time.Second):
+	case <-time.After(c.requestTimeout(method)):
 		c.remove(id)
 		return nil, nil, fmt.Errorf("plugin %s %s timed out", c.cfg.Name, method)
 	}
+}
+
+func (c *Client) requestTimeout(method string) time.Duration {
+	if method == "server/discover" || method == "initialize" || method == "tools/list" {
+		if c.cfg.StartupTimeout > 0 {
+			return c.cfg.StartupTimeout
+		}
+		return 10 * time.Second
+	}
+	if c.cfg.ToolTimeout > 0 {
+		return c.cfg.ToolTimeout
+	}
+	return 60 * time.Second
 }
 func (c *Client) remove(id int64) { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }
 func (c *Client) notify(method string, params any) error {
@@ -175,7 +275,7 @@ func (c *Client) notify(method string, params any) error {
 }
 
 func currentMeta() map[string]any {
-	return map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": map[string]any{"name": "cos-lite", "version": "0.4.3"}, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}}
+	return map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.0"}, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}}
 }
 
 func (c *Client) Discover(ctx context.Context) ([]map[string]any, error) {
@@ -202,7 +302,7 @@ func (c *Client) Discover(ctx context.Context) ([]map[string]any, error) {
 		// deliberately advertise only legacy revisions, so a successful discovery call
 		// is not by itself proof that 2026-07-28 is usable.
 		c.protocol = "2025-11-25"
-		params := map[string]any{"protocolVersion": c.protocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.4.3"}}
+		params := map[string]any{"protocolVersion": c.protocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.0"}}
 		raw, re, e := c.request(ctx, "initialize", params)
 		if e != nil {
 			return nil, e

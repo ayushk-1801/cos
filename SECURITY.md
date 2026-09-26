@@ -15,9 +15,23 @@
 - Mutating file operations reject a final symlink.
 - Child command and LSP environments strip common LLM/MCP API secrets.
 - Long-running commands use their own Linux process group so timeout/cancellation reaches descendants.
+- Stateful terminal, plan, browser, and Task workflows use cryptographically random opaque capability handles. MCP `clientInfo` and connector conversation metadata are not treated as authentication boundaries.
 - JavaScript `exec` uses Node's permission model plus Linux user/network/PID namespaces and fails closed when the namespace sandbox is unavailable.
-- Chromium control uses a dedicated profile and loopback CDP port; no browser extension is installed.
+- Chromium control uses isolated browser contexts with dedicated profiles and loopback CDP ports; no browser extension is installed.
 - Daemon status output redacts the local MCP token. `cos endpoint` intentionally reveals the usable URL on request.
+- OTLP traces and `audit.jsonl` contain operational metadata only. TUI output previews are kept separately in local `activity.jsonl` (mode `0600`), are bounded/redacted, and are never exported through OTLP by default.
+
+## Stateful capability handles
+
+`session_id`, `plan_id`, `browser_context_id`, and `taskId` are random bearer-capability handles and are not enumerable through the normal protocol surface. Possession of a valid handle authorizes continuation of that transient state. ChatGPT's anonymized per-conversation metadata, when present, is hashed only for telemetry/audit grouping; raw conversation identifiers are never persisted.
+
+Treat handles as sensitive transient data and do not paste them into public logs/issues. Audit/trace records exclude these capability values. Self-reported `clientInfo` and connector session metadata are used only for diagnostics/telemetry and are not authentication boundaries. This is not a hostile multi-tenant security boundary.
+
+## TUI activity previews
+
+The Activity view intentionally displays a short preview of textual tool/resource/task output. This preview is useful for local observability but can contain source code, filenames, command output or other application data. It is written only to `~/.local/state/cos-lite/activity.jsonl`, which is mode `0600` and bounded/rotated. It is not included in `audit.jsonl` or OTLP exports.
+
+cos-lite strips ANSI/control sequences, ignores image/audio payloads, bounds previews, and redacts common bearer/API-key/token/password/secret patterns and MCP path tokens. Redaction is best-effort, not a guarantee that arbitrary application secrets can never appear. Treat the activity file like other private local developer state.
 
 ## Skills
 
