@@ -280,7 +280,7 @@ Optional:
 
 - `ripgrep` for faster large-repository search (`find` has a built-in fallback)
 - `script` from `util-linux` for PTY commands
-- Node.js 20+ and `unshare` for sandboxed JavaScript `exec`
+- Node.js 20+ plus either usable Linux user/network namespaces (`unshare`) or a user-systemd seccomp sandbox for JavaScript `exec`
 - the relevant language server(s) for `code_intel`
 - Chromium/Chrome for browser tools
 - OpenAI `tunnel-client` for ChatGPT Secure MCP Tunnel

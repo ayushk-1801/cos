@@ -63,7 +63,7 @@ type rpcError struct {
 }
 
 func New(reg *tools.Registry) *Server {
-	return &Server{Registry: reg, Name: "cos-lite", Version: "0.6.0", Instructions: "Ubuntu-first local coding tools: read/search/edit files, apply exact patches, run and interact with terminal commands, maintain a task plan, and optionally control a dedicated Chromium instance through CDP. No Electron app or browser extension is required."}
+	return &Server{Registry: reg, Name: "cos-lite", Version: "0.6.1", Instructions: "Ubuntu-first local coding tools: read/search/edit files, apply exact patches, run and interact with terminal commands, maintain a task plan, and optionally control a dedicated Chromium instance through CDP. No Electron app or browser extension is required."}
 }
 
 func (s *Server) Update(reg *tools.Registry, resources *resourcepkg.Provider, instructions func(context.Context) string) {

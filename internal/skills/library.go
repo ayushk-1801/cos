@@ -105,7 +105,7 @@ func (l *Library) List() ([]Skill, []string) {
 					continue
 				}
 				project := root.Name + "/" + child.Name()
-				nested, ne := discoverRoot(filepath.Join(childPath, ".agents", "skills"), "repo", project)
+				nested, ne := discoverOptionalRoot(filepath.Join(childPath, ".agents", "skills"), "repo", project)
 				out = append(out, nested...)
 				errs = append(errs, ne...)
 			}
@@ -279,6 +279,14 @@ func discoverRoot(root, scope, project string) ([]Skill, []string) {
 		out = append(out, Skill{ID: id, Name: name, Description: desc, Path: virtual, Scope: scope, Project: project, filePath: p})
 	}
 	return out, errs
+}
+
+func discoverOptionalRoot(root, scope, project string) ([]Skill, []string) {
+	_, err := os.ReadDir(root)
+	if os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
+		return nil, nil
+	}
+	return discoverRoot(root, scope, project)
 }
 
 func parseFrontmatter(text string) (string, string, error) {

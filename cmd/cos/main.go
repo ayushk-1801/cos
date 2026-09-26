@@ -45,7 +45,7 @@ import (
 	"github.com/ayush/cos-lite/internal/workspace"
 )
 
-const version = "0.6.0"
+const version = "0.6.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -169,16 +169,10 @@ func doctor() error {
 		fmt.Println("[info] find will use the built-in search engine; install ripgrep for faster large-repo searches")
 	}
 	check("tty", []string{"script"}, false)
-	check("js exec", []string{"node"}, false)
-	if unshare, err := exec.LookPath("unshare"); err == nil {
-		cmd := exec.Command(unshare, "-Urn", "true")
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("[blocked] %-9s %s exists, but unprivileged user/network namespaces are unavailable (%v)\n", "js sandbox", unshare, err)
-		} else {
-			fmt.Printf("[ok] %-12s %s\n", "js sandbox", unshare)
-		}
+	if mode, err := tools.JSSandboxStatus(); err == nil {
+		fmt.Printf("[ok] %-12s %s\n", "js sandbox", mode)
 	} else {
-		fmt.Println("[optional] js sandbox not found (unshare); JavaScript exec mode will be unavailable")
+		fmt.Printf("[optional] JavaScript exec sandbox unavailable (%v); declarative exec calls still work\n", err)
 	}
 	check("browser", []string{"chromium", "chromium-browser", "google-chrome", "google-chrome-stable"}, false)
 	if p, err := tunnelpkg.FindBinary("tunnel-client"); err == nil {

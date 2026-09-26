@@ -1,6 +1,6 @@
 .PHONY: check-source test build smoke dist release clean
 
-VERSION ?= 0.6.0
+VERSION ?= 0.6.1
 LDFLAGS := -s -w
 
 check-source:

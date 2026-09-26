@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -134,34 +137,17 @@ func nodePermissionFlag(node string) (string, error) {
 }
 
 func (e *ExecMode) handleJS(parent context.Context, code string, timeout time.Duration) (Result, error) {
-	node, err := exec.LookPath("node")
+	runtime, err := selectJSSandboxRuntime()
 	if err != nil {
-		return Error("exec code mode requires Node.js 20+; use the calls array instead or install node"), nil
-	}
-	permissionFlag, err := nodePermissionFlag(node)
-	if err != nil {
-		return Error(err.Error()), nil
-	}
-	unshare, err := exec.LookPath("unshare")
-	if err != nil {
-		return Error("exec code mode requires util-linux unshare for its Linux network/PID sandbox; use the calls array instead"), nil
-	}
-	probe := exec.Command(unshare, "-Urn", "true")
-	if out, err := probe.CombinedOutput(); err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg != "" {
-			msg = ": " + msg
-		}
-		return Error("exec JavaScript mode is unavailable because this host blocks unprivileged Linux user/network namespaces; use the declarative calls form instead" + msg), nil
+		return Error("exec code mode requires Node.js 20+ and a usable Linux sandbox; use the calls array instead: " + err.Error()), nil
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	// Node's permission system denies filesystem, child-process, worker and native-addon
-	// APIs, while a fresh Linux network + PID namespace closes the remaining host-network
-	// and process-control escape hatches. This matters because node:vm by itself is not a
-	// security boundary. If unprivileged user namespaces are disabled, code mode fails
-	// closed and callers can still use the declarative calls form.
-	cmd := exec.CommandContext(ctx, unshare, "-Urnpf", "--kill-child=SIGKILL", "--", node, permissionFlag, "--max-old-space-size=128", "-e", nodeHarness)
+	cmd, cleanup, err := jsSandboxCommand(ctx, runtime, timeout)
+	if err != nil {
+		return Error(err.Error()), nil
+	}
+	defer cleanup()
 	cmd.Env = proc.SanitizedEnv()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -186,7 +172,9 @@ func (e *ExecMode) handleJS(parent context.Context, code string, timeout time.Du
 
 	// Drain stderr to avoid blocking and preserve useful diagnostics if Node itself fails.
 	var stderrText strings.Builder
+	stderrDone := make(chan struct{})
 	go func() {
+		defer close(stderrDone)
 		s := bufio.NewScanner(stderr)
 		for s.Scan() {
 			if stderrText.Len() < 32*1024 {
@@ -230,6 +218,7 @@ func (e *ExecMode) handleJS(parent context.Context, code string, timeout time.Du
 			_ = enc.Encode(map[string]any{"kind": "result", "id": id, "result": map[string]any{"content": res.Content, "structuredContent": res.Structured, "isError": res.IsError}})
 		case "done":
 			_ = cmd.Wait()
+			<-stderrDone
 			payload := msg["value"]
 			pretty, _ := json.MarshalIndent(payload, "", "  ")
 			text := strings.TrimSpace(logs.String())
@@ -245,10 +234,12 @@ func (e *ExecMode) handleJS(parent context.Context, code string, timeout time.Du
 			return Result{Content: []Content{{"type": "text", "text": text}}, Structured: payload}, nil
 		case "error":
 			_ = cmd.Wait()
+			<-stderrDone
 			return Error(fmt.Sprint(msg["error"])), nil
 		}
 	}
 	_ = cmd.Wait()
+	<-stderrDone
 	if ctx.Err() != nil {
 		return Error("exec code mode timed out or was cancelled: " + ctx.Err().Error()), nil
 	}
@@ -257,4 +248,172 @@ func (e *ExecMode) handleJS(parent context.Context, code string, timeout time.Du
 		msg = "exec runtime exited without a result"
 	}
 	return Error(msg), nil
+}
+
+const systemdSandboxFilter = "SystemCallFilter=~@network-io kill tkill tgkill pidfd_send_signal rt_sigqueueinfo rt_tgsigqueueinfo"
+
+// JSSandboxStatus reports the strongest JavaScript sandbox available on this
+// Linux host. A user/network namespace is preferred. When kernels disable
+// unprivileged user namespaces, a transient user-systemd service with seccomp
+// provides a safe fallback while Node's permission model still denies host
+// filesystem, child-process, worker, addon and WASI access.
+func JSSandboxStatus() (string, error) {
+	runtime, err := selectJSSandboxRuntime()
+	if err != nil {
+		return "", err
+	}
+	return runtime.mode + " (" + runtime.node + ")", nil
+}
+
+type jsSandboxRuntime struct {
+	node           string
+	permissionFlag string
+	mode           string
+}
+
+func selectJSSandboxRuntime() (jsSandboxRuntime, error) {
+	runtimes := usableNodeRuntimes()
+	if len(runtimes) == 0 {
+		return jsSandboxRuntime{}, fmt.Errorf("no genuine Node.js 20+ runtime found")
+	}
+	var failures []string
+	if unshare, err := exec.LookPath("unshare"); err == nil {
+		for _, runtime := range runtimes {
+			probe := exec.Command(unshare, "-Urn", "--", runtime.node, runtime.permissionFlag, "-e", "process.stdout.write('ok')")
+			if out, err := probe.CombinedOutput(); err == nil && strings.TrimSpace(string(out)) == "ok" {
+				runtime.mode = "unshare"
+				return runtime, nil
+			} else if err != nil {
+				failures = append(failures, fmt.Sprintf("unshare %s: %v", runtime.node, err))
+			}
+		}
+	}
+	if systemdRun, err := exec.LookPath("systemd-run"); err == nil {
+		for _, runtime := range runtimes {
+			probe := exec.Command(systemdRun,
+				"--user", "--wait", "--pipe", "--quiet", "--collect",
+				"-p", "NoNewPrivileges=yes",
+				"-p", systemdSandboxFilter,
+				"--", runtime.node, runtime.permissionFlag, "-e", "process.stdout.write('ok')",
+			)
+			if out, err := probe.CombinedOutput(); err == nil && strings.TrimSpace(string(out)) == "ok" {
+				runtime.mode = "systemd-run/seccomp"
+				return runtime, nil
+			} else {
+				msg := strings.TrimSpace(string(out))
+				if msg != "" {
+					failures = append(failures, fmt.Sprintf("systemd %s: %s", runtime.node, msg))
+				} else if err != nil {
+					failures = append(failures, fmt.Sprintf("systemd %s: %v", runtime.node, err))
+				}
+			}
+		}
+	}
+	if len(failures) > 4 {
+		failures = failures[:4]
+	}
+	if len(failures) > 0 {
+		return jsSandboxRuntime{}, fmt.Errorf("no Node runtime passed the Linux sandbox probes (%s)", strings.Join(failures, "; "))
+	}
+	return jsSandboxRuntime{}, fmt.Errorf("neither usable unshare nor systemd-run/seccomp sandbox is available")
+}
+
+func findNodeRuntime() (string, string, error) {
+	runtimes := usableNodeRuntimes()
+	if len(runtimes) > 0 {
+		return runtimes[0].node, runtimes[0].permissionFlag, nil
+	}
+	return "", "", fmt.Errorf("no genuine Node.js 20+ runtime found")
+}
+
+func usableNodeRuntimes() []jsSandboxRuntime {
+	candidates := nodeCandidates()
+	var out []jsSandboxRuntime
+	for _, candidate := range candidates {
+		st, err := os.Stat(candidate)
+		if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+			continue
+		}
+		identity, err := exec.Command(candidate, "-e", "process.stdout.write(process.release && process.release.name || '')").Output()
+		if err != nil || strings.TrimSpace(string(identity)) != "node" {
+			continue
+		}
+		permissionFlag, err := nodePermissionFlag(candidate)
+		if err != nil {
+			continue
+		}
+		out = append(out, jsSandboxRuntime{node: candidate, permissionFlag: permissionFlag})
+	}
+	return out
+}
+
+func nodeCandidates() []string {
+	var candidates []string
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		candidates = append(candidates, filepath.Join(dir, "node"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		patterns := []string{
+			filepath.Join(home, ".local", "share", "fnm", "node-versions", "*", "installation", "bin", "node"),
+			filepath.Join(home, ".nvm", "versions", "node", "*", "bin", "node"),
+		}
+		for _, pattern := range patterns {
+			matches, _ := filepath.Glob(pattern)
+			sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+			candidates = append(candidates, matches...)
+		}
+		candidates = append(candidates, filepath.Join(home, ".volta", "bin", "node"))
+	}
+	candidates = append(candidates, "/usr/local/bin/node", "/usr/bin/node")
+	seen := map[string]bool{}
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func jsSandboxCommand(ctx context.Context, runtime jsSandboxRuntime, timeout time.Duration) (*exec.Cmd, func(), error) {
+	if runtime.mode == "unshare" {
+		unshare, err := exec.LookPath("unshare")
+		if err != nil {
+			return nil, nil, fmt.Errorf("unshare disappeared after sandbox probe")
+		}
+		cmd := exec.CommandContext(ctx, unshare, "-Urnpf", "--kill-child=SIGKILL", "--", runtime.node, runtime.permissionFlag, "--max-old-space-size=128", "-e", nodeHarness)
+		return cmd, func() {}, nil
+	}
+	if runtime.mode != "systemd-run/seccomp" {
+		return nil, nil, fmt.Errorf("unknown JavaScript sandbox mode %q", runtime.mode)
+	}
+	systemdRun, err := exec.LookPath("systemd-run")
+	if err != nil {
+		return nil, nil, fmt.Errorf("systemd-run disappeared after sandbox probe")
+	}
+	unit := fmt.Sprintf("cos-lite-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
+	runtimeSec := int(timeout.Seconds()) + 2
+	if runtimeSec < 3 {
+		runtimeSec = 3
+	}
+	cmd := exec.CommandContext(ctx, systemdRun,
+		"--user", "--wait", "--pipe", "--quiet", "--collect", "--unit="+unit,
+		"-p", "NoNewPrivileges=yes",
+		"-p", systemdSandboxFilter,
+		"-p", fmt.Sprintf("RuntimeMaxSec=%ds", runtimeSec),
+		"--", runtime.node, runtime.permissionFlag, "--max-old-space-size=128", "-e", nodeHarness,
+	)
+	cleanup := func() {
+		if systemctl, err := exec.LookPath("systemctl"); err == nil {
+			_ = exec.Command(systemctl, "--user", "stop", unit+".service").Run()
+			_ = exec.Command(systemctl, "--user", "reset-failed", unit+".service").Run()
+		}
+	}
+	return cmd, cleanup, nil
 }

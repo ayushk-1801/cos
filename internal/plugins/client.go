@@ -275,7 +275,7 @@ func (c *Client) notify(method string, params any) error {
 }
 
 func currentMeta() map[string]any {
-	return map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.0"}, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}}
+	return map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.1"}, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}}
 }
 
 func (c *Client) Discover(ctx context.Context) ([]map[string]any, error) {
@@ -302,7 +302,7 @@ func (c *Client) Discover(ctx context.Context) ([]map[string]any, error) {
 		// deliberately advertise only legacy revisions, so a successful discovery call
 		// is not by itself proof that 2026-07-28 is usable.
 		c.protocol = "2025-11-25"
-		params := map[string]any{"protocolVersion": c.protocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.0"}}
+		params := map[string]any{"protocolVersion": c.protocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.1"}}
 		raw, re, e := c.request(ctx, "initialize", params)
 		if e != nil {
 			return nil, e

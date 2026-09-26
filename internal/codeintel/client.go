@@ -466,7 +466,7 @@ func (p *lspProc) close() {
 }
 func (p *lspProc) initializeContext(ctx context.Context, root string) error {
 	caps := map[string]any{"textDocument": map[string]any{"definition": map[string]any{}, "references": map[string]any{}, "hover": map[string]any{}, "documentSymbol": map[string]any{}, "implementation": map[string]any{}, "rename": map[string]any{}, "diagnostic": map[string]any{}}, "workspace": map[string]any{"symbol": map[string]any{}}}
-	_, err := p.requestContext(ctx, "initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.0"}})
+	_, err := p.requestContext(ctx, "initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.1"}})
 	if err != nil {
 		return err
 	}
