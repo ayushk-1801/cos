@@ -1,0 +1,6 @@
+[
+  {
+    "name": "example",
+    "command": ["example-mcp", "--stdio"]
+  }
+]
