@@ -61,7 +61,9 @@ echo "Installed cos-lite to $INSTALL_DIR/cos"
 # Keep installation non-interactive. Enabling the user service is safe even on
 # a fresh install: with no configured projects it records the autostart policy
 # and the daemon starts after the first project is added.
-"$INSTALL_DIR/cos" service enable >/dev/null 2>&1 || true
+if [[ "${COS_ENABLE_SERVICE:-1}" != "0" ]]; then
+  "$INSTALL_DIR/cos" service enable >/dev/null 2>&1 || true
+fi
 
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
   echo
