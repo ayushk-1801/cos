@@ -18,6 +18,7 @@ const (
 	maxSkillBytes   = 128 * 1024
 	maxPackageBytes = 2 * 1024 * 1024
 	maxPackageFiles = 128
+	maxRepoChildren = 256
 )
 
 var skillIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}[A-Za-z0-9]$|^[A-Za-z0-9]$`)
@@ -63,6 +64,30 @@ func (l *Library) List() ([]Skill, []string) {
 			skills, e := discoverRoot(filepath.Join(root.Path, ".agents", "skills"), "repo", root.Name)
 			out = append(out, skills...)
 			errs = append(errs, e...)
+
+			children, err := os.ReadDir(root.Path)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", root.Path, err))
+				continue
+			}
+			for i, child := range children {
+				if i >= maxRepoChildren {
+					errs = append(errs, fmt.Sprintf("%s: child-repo skill scan capped at %d entries", root.Path, maxRepoChildren))
+					break
+				}
+				if !child.IsDir() || strings.HasPrefix(child.Name(), ".") {
+					continue
+				}
+				childPath := filepath.Join(root.Path, child.Name())
+				st, err := os.Lstat(childPath)
+				if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+					continue
+				}
+				project := root.Name + "/" + child.Name()
+				nested, ne := discoverRoot(filepath.Join(childPath, ".agents", "skills"), "repo", project)
+				out = append(out, nested...)
+				errs = append(errs, ne...)
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

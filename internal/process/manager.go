@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -316,6 +317,7 @@ func SanitizedEnv() []string {
 		"COS_TOKEN": true, "CHATGPT_TOKEN": true,
 	}
 	out := make([]string, 0, len(os.Environ()))
+	pathValue := os.Getenv("PATH")
 	for _, kv := range os.Environ() {
 		name := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
@@ -324,10 +326,40 @@ func SanitizedEnv() []string {
 		if blocked[name] {
 			continue
 		}
+		if name == "PATH" {
+			continue
+		}
 		out = append(out, kv)
 	}
+	pathValue = augmentedPATH(pathValue)
+	out = append(out, "PATH="+pathValue)
 	out = append(out, "TERM=xterm-256color", "PAGER=cat", "GIT_PAGER=cat", "NO_COLOR=1")
 	return out
+}
+
+func augmentedPATH(base string) string {
+	var candidates []string
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates,
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, "bin"),
+			filepath.Join(home, "go", "bin"),
+			filepath.Join(home, ".cargo", "bin"),
+		)
+	}
+	candidates = append(candidates, "/usr/local/go/bin")
+	candidates = append(candidates, filepath.SplitList(base)...)
+	seen := map[string]bool{}
+	out := make([]string, 0, len(candidates))
+	for _, p := range candidates {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return strings.Join(out, string(os.PathListSeparator))
 }
 
 func ParseSignal(v string) (syscall.Signal, error) {

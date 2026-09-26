@@ -19,6 +19,13 @@ func unitPath() (string, error) {
 	return filepath.Join(d, "systemd", "user", unitName), nil
 }
 func Available() bool {
+	// Tests, containers and other isolated environments may deliberately want
+	// the direct daemon fallback even when the host happens to have a reachable
+	// user manager. This also prevents an isolated XDG_CONFIG_HOME from writing a
+	// unit the host user manager cannot see.
+	if v := strings.TrimSpace(os.Getenv("COS_DISABLE_SYSTEMD")); v == "1" || strings.EqualFold(v, "true") {
+		return false
+	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return false
 	}

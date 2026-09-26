@@ -74,7 +74,7 @@ func (c *Client) Run(ctx context.Context, req Request) (Response, error) {
 	if !ok {
 		return Response{}, fmt.Errorf("unsupported code-intel language %q", lang)
 	}
-	root := c.rootFor(resolved)
+	root := c.rootFor(resolved, lang)
 	if root.Path == "" {
 		return Response{}, fmt.Errorf("path is outside approved projects")
 	}
@@ -155,37 +155,128 @@ func (c *Client) Run(ctx context.Context, req Request) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
+	if req.Action == "workspace_symbols" {
+		result = c.filterWorkspaceSymbols(result)
+	}
 	result = c.virtualize(result)
 	return Response{Language: lang, Server: strings.Join(cmdline, " "), Result: result}, nil
 }
 
+func (c *Client) filterWorkspaceSymbols(v any) any {
+	items, ok := v.([]any)
+	if !ok {
+		return v
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		loc, _ := m["location"].(map[string]any)
+		uri, _ := loc["uri"].(string)
+		if uri == "" || !strings.HasPrefix(uri, "file://") {
+			out = append(out, item)
+			continue
+		}
+		p, err := pathFromURI(uri)
+		if err == nil && c.approvedPath(p) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (c *Client) approvedPath(path string) bool {
+	clean := filepath.Clean(path)
+	for _, r := range c.WS.Roots {
+		rel, err := filepath.Rel(r.Path, clean)
+		if err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) commandFor(spec languageSpec) ([]string, error) {
 	if ov := c.Overrides[spec.ID]; len(ov) > 0 {
-		if _, err := exec.LookPath(ov[0]); err != nil && !filepath.IsAbs(ov[0]) {
+		if filepath.IsAbs(ov[0]) {
+			if st, err := os.Stat(ov[0]); err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+				return nil, fmt.Errorf("configured %s server %q not executable", spec.ID, ov[0])
+			}
+			return append([]string(nil), ov...), nil
+		}
+		path, err := findExecutable(ov[0])
+		if err != nil {
 			return nil, fmt.Errorf("configured %s server %q not found", spec.ID, ov[0])
 		}
-		return append([]string(nil), ov...), nil
+		return append([]string{path}, ov[1:]...), nil
 	}
 	for _, candidate := range spec.Commands {
 		if len(candidate) == 0 {
 			continue
 		}
-		if path, err := exec.LookPath(candidate[0]); err == nil {
+		if path, err := findExecutable(candidate[0]); err == nil {
 			out := append([]string{path}, candidate[1:]...)
 			return out, nil
 		}
 	}
 	return nil, fmt.Errorf("no %s language server found. %s", spec.ID, spec.Hint)
 }
-func (c *Client) rootFor(path string) workspace.Root {
+func (c *Client) rootFor(path, lang string) workspace.Root {
 	clean := filepath.Clean(path)
 	for _, r := range c.WS.Roots {
 		rel, err := filepath.Rel(r.Path, clean)
 		if err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))) {
-			return r
+			rootPath := nearestLanguageRoot(clean, r.Path, lang)
+			return workspace.Root{Name: r.Name, Path: rootPath}
 		}
 	}
 	return workspace.Root{}
+}
+
+func nearestLanguageRoot(path, boundary, lang string) string {
+	start := path
+	if st, err := os.Stat(start); err == nil && !st.IsDir() {
+		start = filepath.Dir(start)
+	}
+	markers := languageRootMarkers(lang)
+	for dir := filepath.Clean(start); ; dir = filepath.Dir(dir) {
+		for _, marker := range markers {
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+		}
+		if dir == filepath.Clean(boundary) {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		rel, err := filepath.Rel(boundary, parent)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			break
+		}
+	}
+	return filepath.Clean(boundary)
+}
+
+func languageRootMarkers(lang string) []string {
+	switch lang {
+	case "go":
+		return []string{"go.work", "go.mod"}
+	case "rust":
+		return []string{"Cargo.toml"}
+	case "typescript", "javascript":
+		return []string{"tsconfig.json", "jsconfig.json", "package.json"}
+	case "python":
+		return []string{"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"}
+	case "c", "cpp":
+		return []string{"compile_commands.json", "CMakeLists.txt", "meson.build"}
+	default:
+		return nil
+	}
 }
 func (c *Client) virtualize(v any) any {
 	switch x := v.(type) {
@@ -204,7 +295,10 @@ func (c *Client) virtualize(v any) any {
 	case string:
 		if strings.HasPrefix(x, "file://") {
 			if p, err := pathFromURI(x); err == nil {
-				return c.WS.Display(p)
+				if c.approvedPath(p) {
+					return c.WS.Display(p)
+				}
+				return "external://" + filepath.Base(p)
 			}
 		}
 		return x
@@ -329,7 +423,7 @@ func (p *lspProc) close() {
 }
 func (p *lspProc) initialize(root string) error {
 	caps := map[string]any{"textDocument": map[string]any{"definition": map[string]any{}, "references": map[string]any{}, "hover": map[string]any{}, "documentSymbol": map[string]any{}, "implementation": map[string]any{}, "rename": map[string]any{}, "diagnostic": map[string]any{}}, "workspace": map[string]any{"symbol": map[string]any{}}}
-	_, err := p.request("initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.3.1"}})
+	_, err := p.request("initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.4.3"}})
 	if err != nil {
 		return err
 	}
@@ -493,11 +587,36 @@ func AvailableServers() map[string]string {
 	out := map[string]string{}
 	for id, s := range specs() {
 		for _, c := range s.Commands {
-			if p, err := exec.LookPath(c[0]); err == nil {
+			if p, err := findExecutable(c[0]); err == nil {
 				out[id] = p
 				break
 			}
 		}
 	}
 	return out
+}
+
+func findExecutable(name string) (string, error) {
+	if p, err := exec.LookPath(name); err == nil {
+		return p, nil
+	}
+	if filepath.IsAbs(name) {
+		return "", exec.ErrNotFound
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", exec.ErrNotFound
+	}
+	for _, dir := range []string{
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".cargo", "bin"),
+	} {
+		candidate := filepath.Join(dir, name)
+		st, statErr := os.Stat(candidate)
+		if statErr == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
 }

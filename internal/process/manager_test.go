@@ -1,10 +1,28 @@
 package process
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestAugmentedPATHAddsUserAndGoToolchainPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	got := augmentedPATH("/usr/bin:/bin")
+	for _, want := range []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".cargo", "bin"),
+		"/usr/local/go/bin",
+		"/usr/bin",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("PATH %q missing %q", got, want)
+		}
+	}
+}
 
 func TestStartAndPoll(t *testing.T) {
 	m := NewManager()

@@ -2,7 +2,6 @@ package control
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -147,18 +146,14 @@ func WaitStopped(timeout time.Duration) bool {
 	return false
 }
 func TailLog(lines int) (string, error) {
-	p, e := LogPath()
+	text, e := tailLogBytes(logTailBytes)
 	if e != nil {
 		return "", e
 	}
-	b, e := os.ReadFile(p)
-	if errors.Is(e, os.ErrNotExist) {
+	if text == "" {
 		return "", nil
 	}
-	if e != nil {
-		return "", e
-	}
-	parts := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	parts := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if lines > 0 && len(parts) > lines {
 		parts = parts[len(parts)-lines:]
 	}

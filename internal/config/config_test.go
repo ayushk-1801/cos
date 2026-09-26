@@ -87,3 +87,55 @@ func TestLegacyConfigKeepsNewDefaultPolicies(t *testing.T) {
 		t.Fatalf("new defaults lost during legacy load: %+v", cfg)
 	}
 }
+
+func TestLegacyDefaultPortMigratesAwayFromCoS(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p := filepath.Join(dir, "cos-lite", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// This is the shape written by v0.3.1: there was no version field and the
+	// default port collided with Chat On Steroids.
+	if err := os.WriteFile(p, []byte(`{"listen":"127.0.0.1:8765","projects":[]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != currentConfigVersion || cfg.Listen != "127.0.0.1:8766" {
+		t.Fatalf("legacy migration failed: %+v", cfg)
+	}
+}
+
+func TestVersionOnePortMigratesAwayFromCoS(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p := filepath.Join(dir, "cos-lite", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"version":1,"listen":"127.0.0.1:8765","projects":[]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != currentConfigVersion || cfg.Listen != "127.0.0.1:8766" {
+		t.Fatalf("v1 migration failed: %+v", cfg)
+	}
+}
+
+func TestOpenAITunnelValidation(t *testing.T) {
+	cfg := Default()
+	cfg.Tunnel = Tunnel{Provider: "openai", TunnelID: "bad"}
+	if err := cfg.Normalize(); err == nil {
+		t.Fatal("expected invalid tunnel id error")
+	}
+	cfg.Tunnel.TunnelID = "tunnel_0123456789abcdef0123456789abcdef"
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("valid OpenAI tunnel rejected: %v", err)
+	}
+}

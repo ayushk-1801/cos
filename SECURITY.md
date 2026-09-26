@@ -23,7 +23,7 @@
 
 Skills are instructions, not capabilities. A Skill cannot grant filesystem/shell/browser access that the MCP server has not already exposed.
 
-Managed Skill packages are bounded by file/byte limits. Symlinks are refused during discovery/import, and supporting-file reads are constrained to the selected Skill directory. Model-facing Skill metadata uses `/skills/...` virtual paths rather than native config paths.
+Managed Skill packages are bounded by file/byte limits. Symlinks are refused during discovery/import, and supporting-file reads are constrained to the selected Skill directory. Skills use the standard `~/.agents/skills/...` and `<repo>/.agents/skills/...` locations.
 
 A Skill can still contain bad advice or malicious shell instructions. Only install Skills from sources you trust, and rely on the same command/file security policy you would use for any model-authored action.
 
@@ -36,6 +36,10 @@ The LSP is not a kernel sandbox. It runs with the Unix account's privileges and 
 The `rename` action is preview-only. `cos-lite` does not automatically apply the WorkspaceEdit returned by the language server.
 
 ## Tunnels
+
+OpenAI Secure MCP Tunnel stores the runtime API key at `~/.config/cos-lite/openai-tunnel.key` with mode `0600`. The key is not stored in `config.json`, is not passed as a process argument, and is handed to `tunnel-client` only through a `file:` secret reference. The non-secret `tunnel_id` is stored in normal configuration.
+
+`cos-lite` starts `tunnel-client` as a child of the daemon and considers OpenAI tunnel state connected only after the client's local `/readyz` endpoint returns success. The child is terminated with the daemon.
 
 The built-in Cloudflare mode forwards only the loopback origin and retains the secret MCP path in the public URL. A custom tunnel command receives `{local_url}` or `{origin}` only if you explicitly configure it.
 

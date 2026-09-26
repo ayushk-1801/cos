@@ -15,6 +15,81 @@ import (
 	"github.com/ayush/cos-lite/internal/workspace"
 )
 
+func TestFindExecutableSearchesCommonUserBins(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	p := filepath.Join(home, "go", "bin", "gopls")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := findExecutable("gopls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != p {
+		t.Fatalf("got %q, want %q", got, p)
+	}
+}
+
+func TestNearestLanguageRootInsideBroadWorkspace(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "nested", "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/repo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(repo, "pkg", "x.go")
+	if err := os.WriteFile(file, []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := nearestLanguageRoot(file, root, "go"); got != repo {
+		t.Fatalf("got %q, want %q", got, repo)
+	}
+}
+
+func TestVirtualizeRedactsExternalFileURI(t *testing.T) {
+	root := t.TempDir()
+	ws, err := workspace.NewRoots([]workspace.Root{{Name: "proj", Path: root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{WS: ws}
+	inside := filepath.Join(root, "main.go")
+	got := c.virtualize(map[string]any{
+		"inside":  fileURI(inside),
+		"outside": fileURI("/usr/local/go/src/fmt/print.go"),
+	}).(map[string]any)
+	if got["inside"] != "/proj/main.go" {
+		t.Fatalf("inside=%v", got["inside"])
+	}
+	if got["outside"] != "external://print.go" {
+		t.Fatalf("outside=%v", got["outside"])
+	}
+}
+
+func TestFilterWorkspaceSymbolsDropsExternalLocations(t *testing.T) {
+	root := t.TempDir()
+	ws, err := workspace.NewRoots([]workspace.Root{{Name: "proj", Path: root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{WS: ws}
+	v := []any{
+		map[string]any{"name": "local", "location": map[string]any{"uri": fileURI(filepath.Join(root, "main.go"))}},
+		map[string]any{"name": "external", "location": map[string]any{"uri": fileURI("/usr/local/go/src/fmt/print.go")}},
+	}
+	got := c.filterWorkspaceSymbols(v).([]any)
+	if len(got) != 1 || got[0].(map[string]any)["name"] != "local" {
+		t.Fatalf("filtered=%#v", got)
+	}
+}
+
 func TestDefinitionWithFakeLSP(t *testing.T) {
 	root := t.TempDir()
 	file := filepath.Join(root, "main.go")

@@ -11,6 +11,8 @@ import (
 	"strings"
 )
 
+const currentConfigVersion = 2
+
 type Project struct {
 	Name    string `json:"name"`
 	Path    string `json:"path"`
@@ -18,8 +20,9 @@ type Project struct {
 }
 
 type Tunnel struct {
-	Provider string `json:"provider"` // none, cloudflare, custom
+	Provider string `json:"provider"` // none, openai, cloudflare, custom
 	Command  string `json:"command,omitempty"`
+	TunnelID string `json:"tunnel_id,omitempty"`
 }
 
 type Skills struct {
@@ -34,6 +37,7 @@ type CodeIntel struct {
 }
 
 type Config struct {
+	Version     int       `json:"version"`
 	Listen      string    `json:"listen"`
 	Browser     bool      `json:"browser"`
 	Headless    bool      `json:"headless"`
@@ -49,7 +53,8 @@ var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 func Default() Config {
 	return Config{
-		Listen:      "127.0.0.1:8765",
+		Version:     currentConfigVersion,
+		Listen:      "127.0.0.1:8766",
 		Browser:     true,
 		Headless:    true,
 		Autostart:   true,
@@ -88,9 +93,21 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	var meta struct {
+		Version *int `json:"version"`
+	}
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", p, err)
+	}
 	cfg := Default()
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", p, err)
+	}
+	// json.Unmarshal onto defaults intentionally preserves new default policies
+	// for fields older configs never had. Version is different: we need to know
+	// whether it existed on disk so migrations are not skipped by the default.
+	if meta.Version == nil {
+		cfg.Version = 0
 	}
 	if err := cfg.Normalize(); err != nil {
 		return Config{}, err
@@ -123,11 +140,24 @@ func Save(cfg Config) error {
 }
 
 func (c *Config) Normalize() error {
+	// v0.3.0/0.3.1 used 8765, which is also Chat On Steroids' default local
+	// listener. Existing default configs therefore could not run alongside CoS.
+	// Config version 2 reserves 8766 for cos-lite. From v2 onward an explicit
+	// 8765 remains a user choice.
+	if c.Version < 2 {
+		if strings.TrimSpace(c.Listen) == "127.0.0.1:8765" {
+			c.Listen = "127.0.0.1:8766"
+		}
+		c.Version = currentConfigVersion
+	}
+	if c.Version > currentConfigVersion {
+		return fmt.Errorf("config version %d is newer than this cos-lite supports (%d)", c.Version, currentConfigVersion)
+	}
 	if c.CodeIntel.Overrides == nil {
 		c.CodeIntel.Overrides = map[string][]string{}
 	}
 	if strings.TrimSpace(c.Listen) == "" {
-		c.Listen = "127.0.0.1:8765"
+		c.Listen = "127.0.0.1:8766"
 	}
 	if strings.TrimSpace(c.PluginsPath) == "" {
 		c.PluginsPath = "none"
@@ -137,6 +167,11 @@ func (c *Config) Normalize() error {
 	}
 	switch c.Tunnel.Provider {
 	case "none", "cloudflare", "custom":
+	case "openai":
+		if !regexp.MustCompile(`^tunnel_[0-9a-f]{32}$`).MatchString(strings.TrimSpace(c.Tunnel.TunnelID)) {
+			return fmt.Errorf("invalid OpenAI tunnel id %q (expected tunnel_<32 lowercase hex characters>)", c.Tunnel.TunnelID)
+		}
+		c.Tunnel.TunnelID = strings.TrimSpace(c.Tunnel.TunnelID)
 	default:
 		return fmt.Errorf("unsupported tunnel provider %q", c.Tunnel.Provider)
 	}

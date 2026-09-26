@@ -53,6 +53,9 @@ func RunDaemon(ctx context.Context, version string) error {
 	if err := control.EnsureDir(); err != nil {
 		return err
 	}
+	if err := control.RotateLogIfNeeded(); err != nil {
+		return fmt.Errorf("rotate daemon log: %w", err)
+	}
 	logPath, _ := control.LogPath()
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -139,6 +142,7 @@ func RunDaemon(ctx context.Context, version string) error {
 	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
+		log.Printf("listen %s failed: %v", cfg.Listen, err)
 		return err
 	}
 	defer ln.Close()
@@ -190,6 +194,18 @@ func RunDaemon(ctx context.Context, version string) error {
 func tunnelState(s tunnelpkg.Status) string {
 	if s.Provider == "" || s.Provider == "none" {
 		return "disabled"
+	}
+	if s.Provider == "openai" {
+		if s.Ready {
+			return "connected"
+		}
+		if s.Running {
+			return "starting"
+		}
+		if s.Error != "" {
+			return "error"
+		}
+		return "stopped"
 	}
 	if s.Running {
 		if s.PublicURL != "" {

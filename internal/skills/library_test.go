@@ -64,6 +64,41 @@ func TestLegacyCosSkillsAreNotDiscovered(t *testing.T) {
 	}
 }
 
+func TestDiscoverSkillInImmediateChildRepoOfBroadRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	repo := filepath.Join(root, "cos-test")
+	dir := filepath.Join(repo, ".agents", "skills", "smoke")
+	if err := os.MkdirAll(filepath.Join(dir, "references"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: Smoke\ndescription: Nested repo smoke skill.\n---\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "references", "check.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := workspace.NewRoots([]workspace.Root{{Name: "Projects", Path: root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib := &Library{WS: ws, Global: false, Repo: true}
+	list, errs := lib.List()
+	if len(errs) != 0 {
+		t.Fatalf("errs: %v", errs)
+	}
+	if len(list) != 1 || list[0].ID != "Projects/cos-test/smoke" {
+		t.Fatalf("list=%+v", list)
+	}
+	if list[0].Path != "/Projects/cos-test/.agents/skills/smoke/SKILL.md" {
+		t.Fatalf("path=%q", list[0].Path)
+	}
+	_, body, err := lib.ReadFile("Projects/cos-test/smoke", "references/check.txt")
+	if err != nil || body != "ok\n" {
+		t.Fatalf("read nested support file: err=%v body=%q", err, body)
+	}
+}
+
 func TestImportRemoveGlobal(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	dir := t.TempDir()

@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"github.com/ayush/cos-lite/internal/control"
 	"github.com/ayush/cos-lite/internal/service"
 	skillpkg "github.com/ayush/cos-lite/internal/skills"
+	tunnelpkg "github.com/ayush/cos-lite/internal/tunnel"
 	"github.com/ayush/cos-lite/internal/workspace"
 )
 
@@ -41,6 +41,8 @@ const (
 	dashboard screen = iota
 	addProject
 	tunnelSetup
+	openAITunnelID
+	openAITunnelKey
 	customTunnel
 	logsView
 	confirmRemove
@@ -54,6 +56,7 @@ type Model struct {
 	input    string
 	message  string
 	binary   string
+	logsRaw  bool
 }
 type key struct {
 	kind string
@@ -100,11 +103,20 @@ func (m *Model) handle(k key) bool {
 	if k.kind == "ctrlc" {
 		return true
 	}
-	if m.screen == addProject || m.screen == customTunnel {
+	if m.screen == addProject || m.screen == customTunnel || m.screen == openAITunnelID || m.screen == openAITunnelKey {
 		return m.handleInput(k)
 	}
 	switch m.screen {
-	case logsView, skillsView:
+	case logsView:
+		if k.kind == "rune" && k.r == 'r' {
+			m.logsRaw = !m.logsRaw
+			return false
+		}
+		if (k.kind == "rune" && k.r == 'q') || k.kind == "esc" || k.kind == "enter" {
+			m.screen = dashboard
+		}
+		return false
+	case skillsView:
 		if (k.kind == "rune" && k.r == 'q') || k.kind == "esc" || k.kind == "enter" {
 			m.screen = dashboard
 		}
@@ -142,10 +154,16 @@ func (m *Model) handle(k key) bool {
 			case '1':
 				m.setTunnel("none", "")
 			case '2':
-				m.setTunnel("cloudflare", "")
+				m.screen = openAITunnelID
+				m.input = m.cfg.Tunnel.TunnelID
 			case '3':
+				m.setTunnel("cloudflare", "")
+			case '4':
 				m.screen = customTunnel
 				m.input = m.cfg.Tunnel.Command
+			case '5':
+				m.screen = openAITunnelKey
+				m.input = ""
 			}
 		}
 		return false
@@ -232,8 +250,12 @@ func (m *Model) handleInput(k key) bool {
 	case "enter":
 		if m.screen == addProject {
 			m.finishAdd()
-		} else {
+		} else if m.screen == customTunnel {
 			m.setTunnel("custom", strings.TrimSpace(m.input))
+		} else if m.screen == openAITunnelID {
+			m.finishOpenAITunnelID()
+		} else if m.screen == openAITunnelKey {
+			m.finishOpenAIKey()
 		}
 	case "rune":
 		if k.r >= 32 && k.r != 127 {
@@ -241,6 +263,67 @@ func (m *Model) handleInput(k key) bool {
 		}
 	}
 	return false
+}
+
+func (m *Model) finishOpenAITunnelID() {
+	id := strings.TrimSpace(m.input)
+	if id == "" {
+		m.message = "tunnel ID cannot be empty"
+		return
+	}
+	candidate := m.cfg
+	candidate.Tunnel = config.Tunnel{Provider: "openai", TunnelID: id}
+	if err := candidate.Normalize(); err != nil {
+		m.message = err.Error()
+		return
+	}
+	m.cfg.Tunnel = candidate.Tunnel
+	if tunnelpkg.HasOpenAIKey() {
+		m.finishOpenAISetup()
+		return
+	}
+	m.screen = openAITunnelKey
+	m.input = ""
+}
+
+func (m *Model) finishOpenAIKey() {
+	key := strings.TrimSpace(m.input)
+	m.input = ""
+	if key == "" {
+		m.message = "runtime API key cannot be empty"
+		return
+	}
+	if err := tunnelpkg.WriteOpenAIKey(key); err != nil {
+		m.message = err.Error()
+		return
+	}
+	if m.cfg.Tunnel.Provider != "openai" {
+		m.message = "OpenAI tunnel runtime API key stored"
+		m.screen = dashboard
+		return
+	}
+	m.finishOpenAISetup()
+}
+
+func (m *Model) finishOpenAISetup() {
+	if _, err := tunnelpkg.FindBinary("tunnel-client"); err != nil {
+		m.message = "OpenAI tunnel saved, but tunnel-client is not installed"
+	}
+	if err := config.Save(m.cfg); err != nil {
+		m.message = err.Error()
+		return
+	}
+	if isRunning() || m.cfg.Autostart {
+		if err := app.Reconcile(m.binary, m.cfg); err != nil {
+			m.message = err.Error()
+			m.screen = dashboard
+			return
+		}
+	}
+	if m.message == "" {
+		m.message = "OpenAI Secure MCP Tunnel configured"
+	}
+	m.screen = dashboard
 }
 func (m *Model) finishAdd() {
 	p := expandHome(strings.TrimSpace(m.input))
@@ -407,10 +490,14 @@ func render(w *os.File, m *Model) {
 		renderInput(&b, "Add project", "Path", m.input, "Enter add  •  Esc cancel")
 	case customTunnel:
 		renderInput(&b, "Custom tunnel", "Command", m.input, "Use {local_url} or {origin}. Enter save  •  Esc cancel")
+	case openAITunnelID:
+		renderInput(&b, "OpenAI Secure MCP Tunnel", "Tunnel ID", m.input, "Expected tunnel_<32 lowercase hex>. Enter continue  •  Esc cancel")
+	case openAITunnelKey:
+		renderSecretInput(&b, "OpenAI Secure MCP Tunnel", "Runtime API key", m.input, "Stored mode 0600 outside config.json. Enter save  •  Esc cancel")
 	case tunnelSetup:
 		renderTunnel(&b, m)
 	case logsView:
-		renderLogs(&b, height)
+		renderLogs(&b, width, height, m.logsRaw)
 	case skillsView:
 		renderSkills(&b, m, height)
 	case confirmRemove:
@@ -520,24 +607,106 @@ func renderDashboard(b *strings.Builder, m *Model, width, height int) {
 func renderInput(b *strings.Builder, title, label, value, help string) {
 	fmt.Fprintf(b, "\n%s%s%s\n\n%s: %s_\n\n%s%s%s\n", bold, title, reset, label, value, dim, help, reset)
 }
+func renderSecretInput(b *strings.Builder, title, label, value, help string) {
+	mask := ""
+	if value != "" {
+		mask = strings.Repeat("•", min(24, utf8.RuneCountInString(value)))
+	}
+	fmt.Fprintf(b, "\n%s%s%s\n\n%s: %s_\n\n%s%s%s\n", bold, title, reset, label, mask, dim, help, reset)
+}
 func renderTunnel(b *strings.Builder, m *Model) {
-	fmt.Fprintf(b, "\n%sTunnel setup%s\n\nCurrent: %s%s%s\n\n  1  Disabled\n  2  Cloudflare quick tunnel", bold, reset, cyan, m.cfg.Tunnel.Provider, reset)
-	if _, e := exec.LookPath("cloudflared"); e != nil {
+	fmt.Fprintf(b, "\n%sTunnel setup%s\n\nCurrent: %s%s%s", bold, reset, cyan, m.cfg.Tunnel.Provider, reset)
+	if m.cfg.Tunnel.Provider == "openai" && m.cfg.Tunnel.TunnelID != "" {
+		fmt.Fprintf(b, " %s(%s)%s", dim, m.cfg.Tunnel.TunnelID, reset)
+	}
+	b.WriteString("\n\n  1  Disabled\n  2  OpenAI Secure MCP Tunnel")
+	if _, e := tunnelpkg.FindBinary("tunnel-client"); e != nil {
+		b.WriteString(dim + "  (tunnel-client not installed)" + reset)
+	} else if tunnelpkg.HasOpenAIKey() {
+		b.WriteString(green + "  (runtime key configured)" + reset)
+	}
+	b.WriteString("\n  3  Cloudflare quick tunnel")
+	if _, e := tunnelpkg.FindBinary("cloudflared"); e != nil {
 		b.WriteString(dim + "  (cloudflared not installed)" + reset)
 	}
-	b.WriteString("\n  3  Custom command\n\n" + dim + "Custom commands may use {local_url} (tokenized MCP endpoint) and {origin}.\nPress 1/2/3, or q to go back." + reset + "\n")
+	b.WriteString("\n  4  Custom command\n  5  Replace OpenAI runtime API key\n\n" + dim + "OpenAI mode keeps the runtime key in ~/.config/cos-lite/openai-tunnel.key (0600).\nCustom commands may use {local_url} and {origin}.\nPress 1/2/3/4/5, or q to go back." + reset + "\n")
 }
-func renderLogs(b *strings.Builder, height int) {
-	text, err := control.TailLog(max(10, height-7))
-	fmt.Fprintf(b, "\n%sDaemon logs%s\n\n", bold, reset)
-	if err != nil {
-		b.WriteString(red + err.Error() + reset)
-	} else if text == "" {
-		b.WriteString(dim + "No logs yet." + reset)
-	} else {
-		b.WriteString(text)
+func renderLogs(b *strings.Builder, width, height int, raw bool) {
+	mode := "compact"
+	if raw {
+		mode = "raw"
 	}
-	b.WriteString("\n\n" + dim + "Enter/q to return" + reset + "\n")
+	fmt.Fprintf(b, "\n%sDaemon logs%s %s(%s)%s\n\n", bold, reset, dim, mode, reset)
+	rows := max(10, height-7)
+	if raw {
+		text, err := control.TailLog(rows)
+		if err != nil {
+			b.WriteString(red + err.Error() + reset)
+		} else if text == "" {
+			b.WriteString(dim + "No logs yet." + reset)
+		} else {
+			for _, line := range strings.Split(text, "\n") {
+				b.WriteString(dim + clipText(line, width-2) + reset + "\n")
+			}
+		}
+	} else {
+		entries, err := control.TailLogEntries(rows, false)
+		if err != nil {
+			b.WriteString(red + err.Error() + reset)
+		} else if len(entries) == 0 {
+			b.WriteString(dim + "No noteworthy events yet. Press r for raw logs." + reset)
+		} else {
+			for _, e := range entries {
+				ts := "--:--:--"
+				if !e.Time.IsZero() {
+					ts = e.Time.Format("15:04:05")
+				}
+				level := strings.ToUpper(e.Level)
+				if level == "" {
+					level = "INFO"
+				}
+				levelColor := dim
+				switch level {
+				case "ERROR", "FATAL":
+					levelColor = red
+				case "WARN", "WARNING":
+					levelColor = yellow
+				case "INFO":
+					levelColor = green
+				}
+				component := e.Component
+				if component == "" {
+					component = "daemon"
+				}
+				prefixWidth := 8 + 2 + 5 + 2 + 8 + 2
+				message := e.Message
+				if e.Count > 1 {
+					message += fmt.Sprintf("  ×%d", e.Count)
+				}
+				msg := clipText(message, max(10, width-prefixWidth-2))
+				fmt.Fprintf(b, "%s%s%s  %s%-5s%s  %s%-8s%s  %s\n", dim, ts, reset, levelColor, level, reset, cyan, component, reset, msg)
+			}
+		}
+	}
+	footer := "[r] raw logs   Enter/q return"
+	if raw {
+		footer = "[r] compact logs   Enter/q return"
+	}
+	b.WriteString("\n" + dim + footer + reset + "\n")
+}
+
+func clipText(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= width {
+		return s
+	}
+	if width <= 1 {
+		return "…"
+	}
+	return string(r[:width-1]) + "…"
 }
 func renderConfirm(b *strings.Builder, m *Model) {
 	name := ""

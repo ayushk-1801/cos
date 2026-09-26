@@ -35,7 +35,7 @@ Quitting the TUI does **not** stop the daemon.
 |---|---|
 | `read` | Read files, line ranges, and folders inside exposed projects |
 | `view_image` | Return PNG/JPEG/GIF/WebP as native MCP image content |
-| `find` | Search project contents with ripgrep |
+| `find` | Search project contents with ripgrep when available, otherwise a bounded built-in fallback |
 | `apply_patch` | Exact-context Add/Update/Delete/Move patches |
 | `exec_command` | Run shell commands, builds, tests, git, etc.; supports long-running sessions and PTYs |
 | `write_stdin` | Poll/interact with running commands; `\u0003` sends SIGINT to the process group |
@@ -76,6 +76,8 @@ Repo-local Skills live at:
 ```text
 <project>/.agents/skills/<id>/SKILL.md
 ```
+
+If you expose a broad parent such as `~/Desktop/Projects`, cos-lite also checks each immediate child directory for the same standard `.agents/skills` layout. That scan is bounded and non-recursive.
 
 A minimal Skill:
 
@@ -127,6 +129,8 @@ Model-facing Skill paths never expose the native config directory. They look lik
 ## Semantic code intelligence
 
 `code_intel` talks directly to installed language servers. Servers start lazily for a request and are shut down afterward, so there is no idle LSP farm.
+
+For broad exposed roots, cos-lite selects the nearest language/project marker (`go.mod`, `Cargo.toml`, `tsconfig.json`, `pyproject.toml`, `CMakeLists.txt`, etc.) as the LSP root. File locations returned by an LSP outside approved project roots are redacted, and `workspace_symbols` filters external filesystem locations.
 
 Supported language families:
 
@@ -193,16 +197,16 @@ This version does not implement ChatGPT conversation automation:
 
 ## Setup compared with Chat On Steroids
 
-The ChatGPT-side idea is the same: a local MCP server is exposed through a reachable HTTPS tunnel and added as a ChatGPT MCP connector. cos-lite deliberately makes the machine-side setup smaller:
+The ChatGPT-side idea is the same: a local MCP server is exposed through a tunnel and added as a ChatGPT MCP connector. cos-lite deliberately makes the machine-side setup smaller:
 
 - one `cos` binary instead of Electron
 - one MCP connector/endpoint for the enabled cos-lite tools
 - no Chrome extension or pairing step
 - projects are managed in the TUI and served automatically by the user service
-- the tunnel is configured from the TUI (`t`) or `cos tunnel ...`
+- OpenAI Secure MCP Tunnel is a first-class TUI/CLI provider; Cloudflare/custom remain available
 - after the connector is added to ChatGPT once, normal reboots do not require setup again
 
-Use `cos endpoint` to print the URL that should be entered for the ChatGPT connector.
+With OpenAI Secure MCP Tunnel, `cos endpoint` prints the `tunnel_id` to select/paste in ChatGPT. With URL-based tunnel providers it prints the public MCP URL.
 
 ## Requirements
 
@@ -212,14 +216,15 @@ Required:
 
 - Ubuntu or another modern Linux distribution
 - `bash`
-- `ripgrep`
 
 Optional:
 
+- `ripgrep` for faster large-repository search (`find` has a built-in fallback)
 - `script` from `util-linux` for PTY commands
 - Node.js 20+ and `unshare` for sandboxed JavaScript `exec`
 - the relevant language server(s) for `code_intel`
 - Chromium/Chrome for browser tools
+- OpenAI `tunnel-client` for ChatGPT Secure MCP Tunnel
 - `cloudflared` for the built-in Cloudflare quick-tunnel option
 - a working `systemd --user` instance for persistent autostart
 
@@ -326,6 +331,8 @@ cos code-intel disable
 
 cos tunnel status
 cos tunnel set none
+cos tunnel key-from-file /secure/path/runtime-key
+cos tunnel set openai tunnel_0123456789abcdef0123456789abcdef
 cos tunnel set cloudflare
 cos tunnel set custom 'my-tunnel --forward {local_url}'
 
@@ -334,11 +341,45 @@ cos service disable
 cos service status
 ```
 
-`cos endpoint` prints the public tunnel URL when a tunnel is connected, otherwise the local tokenized MCP URL. `cos status` deliberately redacts the local path token.
+`cos endpoint` prints the OpenAI `tunnel_id` when the OpenAI provider is selected, the public URL for URL-based tunnels, or the local tokenized MCP URL when tunneling is disabled. `cos status` deliberately redacts the local path token.
 
 ## Tunnel setup
 
-The TUI `t` screen supports disabled, Cloudflare quick tunnel, and a custom tunnel command.
+The TUI `t` screen supports OpenAI Secure MCP Tunnel, Cloudflare quick tunnel, a custom command, and disabled mode.
+
+### OpenAI Secure MCP Tunnel
+
+Install OpenAI's `tunnel-client` and make sure `tunnel-client` is on `PATH`. The current client requires a tunnel ID, a runtime control-plane API key, and an MCP target. cos-lite supplies its own local tokenized MCP URL as the target and supervises `tunnel-client` as a child of the cos-lite daemon.
+
+In the TUI:
+
+1. Run `cos` and press `t`.
+2. Choose `OpenAI Secure MCP Tunnel`.
+3. Enter the `tunnel_...` ID from OpenAI Tunnels management.
+4. Enter the Runtime API key created with Tunnels Read + Use permission.
+5. cos-lite restarts the daemon and waits for tunnel-client's `/readyz` before showing the tunnel as connected.
+
+The runtime key is never written to `config.json` or passed in process arguments. It is stored separately at:
+
+```text
+~/.config/cos-lite/openai-tunnel.key
+```
+
+with mode `0600`, and tunnel-client receives only `--control-plane.api-key=file:...`. The tunnel ID is stored in normal cos-lite config because it is an identifier rather than a secret.
+
+CLI setup is also available without putting the API key in shell history:
+
+```bash
+cos tunnel key-from-file /secure/path/openai-runtime-key
+cos tunnel set openai tunnel_0123456789abcdef0123456789abcdef
+cos tunnel status
+```
+
+When this provider is active, the existing `cos-lite.service` manages both the MCP daemon and its `tunnel-client` child, so there is no second systemd service to maintain.
+
+One OpenAI `tunnel_id` must have only one local tunnel-client runtime. Running original Chat On Steroids and cos-lite against the same tunnel ID can split MCP requests between different local servers. cos-lite detects an already-running local tunnel-client using the configured tunnel ID and refuses to start that duplicate runtime with a clear error.
+
+### Cloudflare/custom tunnels
 
 A custom command can use:
 
@@ -444,7 +485,9 @@ The JavaScript process receives no direct filesystem or child-process grants. On
 
 ## Security model
 
-The daemon binds to loopback. Its MCP endpoint contains a persistent random path token stored mode `0600` in `~/.config/cos-lite/http-token`. HTTP Origin validation reduces DNS-rebinding risk.
+The daemon binds to loopback (`127.0.0.1:8766` by default). v0.3.2+ migrates the old unversioned `127.0.0.1:8765` default because that port conflicts with Chat On Steroids when both are installed. Its MCP endpoint contains a persistent random path token stored mode `0600` in `~/.config/cos-lite/http-token`. HTTP Origin validation reduces DNS-rebinding risk.
+
+The OpenAI tunnel runtime API key is stored separately in `~/.config/cos-lite/openai-tunnel.key` with mode `0600`. It is passed to tunnel-client by `file:` reference, never embedded in the tunnel command line or normal cos-lite configuration.
 
 Filesystem tools canonicalize configured roots, resolve symlinks, reject root escapes, and require explicit project names when multiple roots are enabled.
 

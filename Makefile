@@ -1,9 +1,12 @@
-.PHONY: test build smoke dist release clean
+.PHONY: check-source test build smoke dist release clean
 
-VERSION ?= 0.3.1
+VERSION ?= 0.4.3
 LDFLAGS := -s -w
 
-test:
+check-source:
+	test -s cmd/cos/main.go
+
+test: check-source
 	go test ./...
 	go vet ./...
 
@@ -19,7 +22,7 @@ dist:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='$(LDFLAGS)' -o dist/cos-linux-amd64 ./cmd/cos
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='$(LDFLAGS)' -o dist/cos-linux-arm64 ./cmd/cos
 
-release: test smoke dist
+release: check-source test smoke dist
 	cd dist && sha256sum cos-linux-amd64 cos-linux-arm64 > SHA256SUMS
 
 clean:

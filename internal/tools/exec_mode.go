@@ -146,6 +146,14 @@ func (e *ExecMode) handleJS(parent context.Context, code string, timeout time.Du
 	if err != nil {
 		return Error("exec code mode requires util-linux unshare for its Linux network/PID sandbox; use the calls array instead"), nil
 	}
+	probe := exec.Command(unshare, "-Urn", "true")
+	if out, err := probe.CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			msg = ": " + msg
+		}
+		return Error("exec JavaScript mode is unavailable because this host blocks unprivileged Linux user/network namespaces; use the declarative calls form instead" + msg), nil
+	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	// Node's permission system denies filesystem, child-process, worker and native-addon
