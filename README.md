@@ -302,6 +302,19 @@ cos doctor
 
 ## Install
 
+### One-line install from GitHub Releases
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | bash
+```
+
+The installer detects `amd64`/`arm64`, downloads the latest GitHub Release binary, verifies it against `SHA256SUMS`, and installs `cos` to `~/.local/bin` by default. Pin a version with `COS_VERSION`, for example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | COS_VERSION=0.6.1 bash
+```
+
+
 From the release directory:
 
 ```bash
