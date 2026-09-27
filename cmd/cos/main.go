@@ -30,6 +30,7 @@ import (
 	"github.com/ayush/cos-lite/internal/config"
 	"github.com/ayush/cos-lite/internal/control"
 	"github.com/ayush/cos-lite/internal/instructions"
+	"github.com/ayush/cos-lite/internal/managedproc"
 	"github.com/ayush/cos-lite/internal/mcp"
 	planpkg "github.com/ayush/cos-lite/internal/plan"
 	"github.com/ayush/cos-lite/internal/plugins"
@@ -37,6 +38,7 @@ import (
 	resourcepkg "github.com/ayush/cos-lite/internal/resources"
 	"github.com/ayush/cos-lite/internal/service"
 	skillpkg "github.com/ayush/cos-lite/internal/skills"
+	"github.com/ayush/cos-lite/internal/sysinfo"
 	taskpkg "github.com/ayush/cos-lite/internal/tasks"
 	"github.com/ayush/cos-lite/internal/telemetry"
 	"github.com/ayush/cos-lite/internal/tools"
@@ -45,7 +47,7 @@ import (
 	"github.com/ayush/cos-lite/internal/workspace"
 )
 
-const version = "0.6.1"
+const version = "0.7.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -81,6 +83,8 @@ func run(args []string) error {
 		return nil
 	case "doctor":
 		return doctor()
+	case "top":
+		return topCommand(args[1:])
 	case "daemon":
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -141,6 +145,7 @@ Usage:
   cos logs [--raw] [LINES]
   cos audit [--json] [LINES]
   cos doctor
+  cos top [--once] [--interval 1s]
   cos serve [flags] [PATH]    One-off MCP server (stdio or HTTP)
 `)
 }
@@ -212,10 +217,197 @@ func doctor() error {
 	}
 	cfg, _ := config.Load()
 	fmt.Printf("[info] autostart policy=%v; linger=%v\n", cfg.Autostart, service.LingerEnabled())
+	for _, p := range cfg.EnabledProjects() {
+		st, err := os.Stat(p.Path)
+		if err != nil {
+			fmt.Printf("[warn] project %-10s %s (%v)\n", p.Name, p.Path, err)
+			continue
+		}
+		if !st.IsDir() {
+			fmt.Printf("[warn] project %-10s %s is not a directory\n", p.Name, p.Path)
+		} else {
+			fmt.Printf("[ok] project %-10s %s\n", p.Name, p.Path)
+		}
+	}
+	if pid, running := control.Running(); running {
+		sampler := sysinfo.NewSampler()
+		snap := sampler.Sample(pid)
+		fmt.Printf("[ok] %-12s pid=%d pss=%s memory-pressure=%s\n", "daemon", pid, sysinfo.Bytes(snap.TotalPSS), snap.Memory.Pressure)
+		if state, err := control.ReadState(); err == nil {
+			if err := probeMCPEndpoint(state.Endpoint); err != nil {
+				fmt.Printf("[warn] %-12s %v\n", "MCP endpoint", err)
+			} else {
+				fmt.Printf("[ok] %-12s local endpoint responds\n", "MCP endpoint")
+			}
+		}
+		if stale, err := managedproc.StaleEntries(pid); err == nil {
+			if len(stale) == 0 {
+				fmt.Printf("[ok] %-12s no registered orphan children\n", "child cleanup")
+			} else {
+				fmt.Printf("[warn] %-12s %d orphan children will be cleaned at next daemon start\n", "child cleanup", len(stale))
+			}
+		}
+	} else {
+		fmt.Printf("[info] %-12s stopped\n", "daemon")
+	}
+	if duplicate := duplicateOpenAITunnelProcesses(cfg.Tunnel.TunnelID); duplicate > 1 {
+		fmt.Printf("[warn] %-12s tunnel ID is used by %d local tunnel-client processes\n", "tunnel ID", duplicate)
+	} else if cfg.Tunnel.Provider == "openai" && strings.TrimSpace(cfg.Tunnel.TunnelID) != "" {
+		fmt.Printf("[ok] %-12s no duplicate local process detected\n", "tunnel ID")
+	}
+	if codex, warnings, err := plugins.LoadCodexConfig(); err != nil {
+		fmt.Printf("[warn] %-12s %v\n", "Codex MCP", err)
+	} else {
+		fmt.Printf("[ok] %-12s %d enabled stdio server(s)\n", "Codex MCP", len(codex))
+		for _, warning := range warnings {
+			fmt.Printf("[warn] Codex MCP   %s\n", warning)
+		}
+	}
+	if health, err := plugins.ReadHealth(); err == nil {
+		for _, h := range health.Servers {
+			state := "ok"
+			if h.State == "error" {
+				state = "warn"
+			}
+			fmt.Printf("[%s] MCP %-8s state=%s tools=%d calls=%d failures=%d", state, h.Name, h.State, h.ToolCount, h.Calls, h.Failures)
+			if h.PID > 0 {
+				fmt.Printf(" pid=%d", h.PID)
+			}
+			if h.LastError != "" {
+				fmt.Printf(" error=%s", clipDoctor(h.LastError, 100))
+			}
+			fmt.Println()
+		}
+	}
+	if dir, err := control.Dir(); err == nil {
+		for _, name := range []string{"plans.json", "tasks.json", "managed-processes.json", "mcp-health.json"} {
+			p := filepath.Join(dir, name)
+			if st, err := os.Stat(p); err == nil {
+				fmt.Printf("[ok] state %-7s %s (%d bytes, mode %04o)\n", strings.TrimSuffix(name, ".json"), p, st.Size(), st.Mode().Perm())
+			}
+		}
+	}
 	if missingRequired {
 		fmt.Println("[fix] install the missing required tools shown above")
 	}
 	return nil
+}
+
+func probeMCPEndpoint(endpoint string) error {
+	if strings.TrimSpace(endpoint) == "" {
+		return errors.New("endpoint not recorded")
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"cos-doctor","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}`))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "tools/list")
+	c := http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func duplicateOpenAITunnelProcesses(tunnelID string) int {
+	tunnelID = strings.TrimSpace(tunnelID)
+	if tunnelID == "" {
+		return 0
+	}
+	entries, _ := os.ReadDir("/proc")
+	count := 0
+	needle := "--control-plane.tunnel-id=" + tunnelID
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err == nil && strings.Contains(strings.ReplaceAll(string(b), "\x00", " "), needle) {
+			count++
+		}
+	}
+	return count
+}
+
+func clipDoctor(s string, n int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+func topCommand(args []string) error {
+	fs := flag.NewFlagSet("cos top", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	once := fs.Bool("once", false, "print one resource snapshot and exit")
+	interval := fs.Duration("interval", time.Second, "refresh interval")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *interval < 200*time.Millisecond {
+		return fmt.Errorf("interval must be at least 200ms")
+	}
+	pid, running := control.Running()
+	if !running {
+		return fmt.Errorf("cos-lite daemon is not running")
+	}
+	interactive := false
+	if st, err := os.Stdout.Stat(); err == nil {
+		interactive = st.Mode()&os.ModeCharDevice != 0
+	}
+	if !interactive {
+		*once = true
+	}
+	sampler := sysinfo.NewSampler()
+	// Prime CPU deltas so --once is useful too; the first /proc sample has no
+	// previous tick baseline by definition.
+	_ = sampler.Sample(pid)
+	time.Sleep(250 * time.Millisecond)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	for {
+		snap := sampler.Sample(pid)
+		if interactive && !*once {
+			fmt.Print("\x1b[H\x1b[2J")
+		}
+		printTopSnapshot(os.Stdout, snap)
+		if *once {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(*interval):
+		}
+	}
+}
+
+func printTopSnapshot(w io.Writer, snap sysinfo.Snapshot) {
+	fmt.Fprintf(w, "cos top  pid=%d  pss=%s  rss=%s  cpu=%.1f%%  memory=%s (%s available)\n\n",
+		snap.RootPID, sysinfo.Bytes(snap.TotalPSS), sysinfo.Bytes(snap.TotalRSS), snap.TotalCPU, snap.Memory.Pressure, sysinfo.Bytes(snap.Memory.AvailableBytes))
+	fmt.Fprintln(w, "GROUP      COUNT       PSS       RSS      CPU")
+	for _, g := range snap.Groups {
+		fmt.Fprintf(w, "%-10s %5d %9s %9s %7.1f%%\n", g.Kind, g.Count, sysinfo.Bytes(g.PSSBytes), sysinfo.Bytes(g.RSSBytes), g.CPU)
+	}
+	fmt.Fprintln(w, "\n  PID  KIND           PSS      CPU  LABEL / COMMAND")
+	limit := min(15, len(snap.Processes))
+	for _, p := range snap.Processes[:limit] {
+		label := strings.TrimSpace(p.Label)
+		if label == "" {
+			label = clipDoctor(p.Command, 72)
+		}
+		fmt.Fprintf(w, "%5d  %-8s %9s %7.1f%%  %s\n", p.PID, p.Kind, sysinfo.Bytes(p.PSSBytes), p.CPU, label)
+	}
+	fmt.Fprintln(w, "\nCtrl-C to exit")
 }
 
 func printStatus() error {

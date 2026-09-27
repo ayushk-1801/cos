@@ -241,6 +241,24 @@ cos code-intel disable
 
 The TUI key is `c`.
 
+## Runtime reliability and resource control
+
+cos-lite keeps heavy helpers lazy and reclaims them adaptively. LSPs normally stay warm for about five minutes and browser contexts for about thirty minutes, but those idle windows shrink automatically when system memory is low or the corresponding process pool becomes large. This preserves fast warm calls on a healthy machine without letting Chrome or language servers grow without bound under pressure.
+
+Managed browser, LSP, and stdio MCP children are recorded with their owning daemon. On startup cos-lite removes registered children whose previous daemon died, and also cleans clearly identifiable orphaned legacy cos-lite Chromium profiles. It deliberately does not kill unrelated language-server or Node processes.
+
+Plans and MCP Tasks are persisted under the private cos-lite state directory. Completed task results and plans survive daemon restarts; a task that was still running when the daemon died is restored as failed with an explicit restart reason rather than pretending its old terminal session can be resumed safely.
+
+Inspect runtime usage from the CLI:
+
+```bash
+cos top
+cos top --once
+cos doctor
+```
+
+`cos top` groups the daemon tree into daemon, tunnel, browser, LSP, external MCP, shell, and other processes with PSS/RSS/CPU totals. In the TUI, press `p` for the live resource view and `m` for the Codex MCP server health dashboard.
+
 ## Intentionally excluded
 
 This version does not implement ChatGPT conversation automation:
@@ -311,7 +329,7 @@ curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-releas
 The installer detects `amd64`/`arm64`, downloads the latest GitHub Release binary, verifies it against `SHA256SUMS`, and installs `cos` to `~/.local/bin` by default. Pin a version with `COS_VERSION`, for example:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | COS_VERSION=0.6.1 bash
+curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | COS_VERSION=0.7.0 bash
 ```
 
 

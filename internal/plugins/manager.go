@@ -13,24 +13,143 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ayush/cos-lite/internal/control"
 	"github.com/ayush/cos-lite/internal/tools"
 )
 
 type Manager struct {
-	mu      sync.Mutex
-	servers []*managedServer
-	stop    chan struct{}
-	once    sync.Once
+	mu       sync.Mutex
+	servers  []*managedServer
+	stop     chan struct{}
+	once     sync.Once
+	onChange func()
 }
 
 const codexMCPIdleTTL = 10 * time.Minute
 
 type managedServer struct {
-	mu       sync.Mutex
-	ctx      context.Context
-	cfg      Config
-	client   *Client
-	lastUsed time.Time
+	mu          sync.Mutex
+	ctx         context.Context
+	cfg         Config
+	client      *Client
+	lastUsed    time.Time
+	lastStarted time.Time
+	lastError   string
+	calls       uint64
+	failures    uint64
+	toolCount   int
+	manager     *Manager
+}
+
+type ServerHealth struct {
+	Name        string `json:"name"`
+	State       string `json:"state"`
+	PID         int    `json:"pid,omitempty"`
+	ToolCount   int    `json:"tool_count"`
+	Calls       uint64 `json:"calls"`
+	Failures    uint64 `json:"failures"`
+	LastStarted string `json:"last_started,omitempty"`
+	LastUsed    string `json:"last_used,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	Command     string `json:"command,omitempty"`
+}
+
+type HealthFile struct {
+	UpdatedAt string         `json:"updated_at"`
+	Servers   []ServerHealth `json:"servers"`
+}
+
+func NewManager(onChange func()) *Manager { return &Manager{onChange: onChange} }
+
+func (m *Manager) signal() {
+	if m != nil && m.onChange != nil {
+		m.onChange()
+	}
+}
+
+func HealthPath() (string, error) {
+	d, err := control.Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "mcp-health.json"), nil
+}
+
+func WriteHealth(servers []ServerHealth) error {
+	if err := control.EnsureDir(); err != nil {
+		return err
+	}
+	p, err := HealthPath()
+	if err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(HealthFile{UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano), Servers: servers}, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+func ReadHealth() (HealthFile, error) {
+	p, err := HealthPath()
+	if err != nil {
+		return HealthFile{}, err
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return HealthFile{}, err
+	}
+	var h HealthFile
+	err = json.Unmarshal(b, &h)
+	return h, err
+}
+
+func (m *Manager) Health() []ServerHealth {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	servers := append([]*managedServer(nil), m.servers...)
+	m.mu.Unlock()
+	out := make([]ServerHealth, 0, len(servers))
+	for _, server := range servers {
+		if server == nil {
+			continue
+		}
+		server.mu.Lock()
+		state := "idle"
+		pid := 0
+		if server.client != nil && !server.client.Closed() {
+			state = "running"
+			pid = server.client.PID()
+		} else if server.lastError != "" {
+			state = "error"
+		}
+		h := ServerHealth{
+			Name: server.cfg.Name, State: state, PID: pid, ToolCount: server.toolCount,
+			Calls: server.calls, Failures: server.failures, LastError: server.lastError,
+			Command: strings.Join(server.cfg.Command, " "),
+		}
+		if !server.lastStarted.IsZero() {
+			h.LastStarted = server.lastStarted.UTC().Format(time.RFC3339Nano)
+		}
+		if !server.lastUsed.IsZero() {
+			h.LastUsed = server.lastUsed.UTC().Format(time.RFC3339Nano)
+		}
+		server.mu.Unlock()
+		out = append(out, h)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // CodexConfigPath returns Codex's standard config.toml. CODEX_HOME follows the
@@ -448,6 +567,10 @@ func (m *Manager) Register(ctx context.Context, reg *tools.Registry, cfgs []Conf
 	for _, discovered := range results {
 		if discovered.err != nil {
 			warnings = append(warnings, discovered.err.Error())
+			server := &managedServer{ctx: ctx, cfg: discovered.cfg, lastError: discovered.err.Error(), manager: m}
+			m.mu.Lock()
+			m.servers = append(m.servers, server)
+			m.mu.Unlock()
 			continue
 		}
 		cfg := discovered.cfg
@@ -455,7 +578,7 @@ func (m *Manager) Register(ctx context.Context, reg *tools.Registry, cfgs []Conf
 		if c == nil {
 			continue
 		}
-		server := &managedServer{ctx: ctx, cfg: cfg, lastUsed: time.Now()}
+		server := &managedServer{ctx: ctx, cfg: cfg, lastUsed: time.Now(), toolCount: len(discovered.defs), manager: m}
 		// Discovery is needed to expose concrete tools, but keeping every Codex
 		// MCP process resident forever would make idle memory scale with config.
 		// Close the discovery instance and restart lazily on first actual call.
@@ -510,6 +633,7 @@ func (m *Manager) Register(ctx context.Context, reg *tools.Registry, cfgs []Conf
 			}
 		}
 	}
+	m.signal()
 	return warnings
 }
 
@@ -528,6 +652,7 @@ func (m *Manager) Close() {
 		for _, server := range servers {
 			server.Close()
 		}
+		m.signal()
 	})
 }
 
@@ -535,8 +660,14 @@ func (s *managedServer) Call(ctx context.Context, tool string, args map[string]a
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.client == nil || s.client.Closed() {
+		s.lastStarted = time.Now()
 		c, err := Start(s.ctx, s.cfg)
 		if err != nil {
+			s.lastError = err.Error()
+			s.failures++
+			if s.manager != nil {
+				s.manager.signal()
+			}
 			return nil, err
 		}
 		startupTimeout := s.cfg.StartupTimeout
@@ -548,16 +679,35 @@ func (s *managedServer) Call(ctx context.Context, tool string, args map[string]a
 		cancel()
 		if err != nil {
 			c.Close()
+			s.lastError = err.Error()
+			s.failures++
+			if s.manager != nil {
+				s.manager.signal()
+			}
 			return nil, err
 		}
 		s.client = c
+		s.lastError = ""
+		if s.manager != nil {
+			s.manager.signal()
+		}
 	}
 	s.lastUsed = time.Now()
+	s.calls++
 	res, err := s.client.Call(ctx, tool, args)
 	if err != nil && s.client.Closed() {
 		s.client = nil
 	}
+	if err != nil {
+		s.failures++
+		s.lastError = err.Error()
+	} else {
+		s.lastError = ""
+	}
 	s.lastUsed = time.Now()
+	if s.manager != nil {
+		s.manager.signal()
+	}
 	return res, err
 }
 
@@ -571,6 +721,9 @@ func (s *managedServer) Close() {
 	s.mu.Unlock()
 	if c != nil {
 		c.Close()
+	}
+	if s.manager != nil {
+		s.manager.signal()
 	}
 }
 
@@ -592,6 +745,7 @@ func (m *Manager) reaper(stop <-chan struct{}) {
 					server.client = nil
 					server.mu.Unlock()
 					c.Close()
+					m.signal()
 					continue
 				}
 				server.mu.Unlock()

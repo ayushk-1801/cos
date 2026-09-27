@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/ayush/cos-lite/internal/sysinfo"
 )
 
 type poolEntry struct {
@@ -25,7 +27,7 @@ type Pool struct {
 }
 
 func NewPool(headless bool) *Pool {
-	return NewPoolWithTTL(headless, 30*time.Minute, 5*time.Minute)
+	return NewPoolWithTTL(headless, 30*time.Minute, 30*time.Second)
 }
 
 func NewPoolWithTTL(headless bool, idleTTL, sweep time.Duration) *Pool {
@@ -154,12 +156,13 @@ func (p *Pool) reaper() {
 
 func (p *Pool) evictIdle(now time.Time) {
 	p.mu.Lock()
+	ttl := p.adaptiveTTL()
 	var stale []struct {
 		id string
 		m  *Manager
 	}
 	for id, entry := range p.clients {
-		if entry.manager != nil && now.Sub(entry.lastUsed) >= p.idleTTL {
+		if entry.manager != nil && now.Sub(entry.lastUsed) >= ttl {
 			stale = append(stale, struct {
 				id string
 				m  *Manager
@@ -181,4 +184,35 @@ func (p *Pool) evictIdle(now time.Time) {
 	for _, item := range stale {
 		item.m.Shutdown()
 	}
+}
+
+func (p *Pool) adaptiveTTL() time.Duration {
+	ttl := p.idleTTL
+	switch sysinfo.MemoryStatus().Pressure {
+	case sysinfo.PressureCritical:
+		ttl = minDuration(ttl, time.Minute)
+	case sysinfo.PressureElevated:
+		ttl = minDuration(ttl, 5*time.Minute)
+	}
+	var total uint64
+	for _, entry := range p.clients {
+		if entry.manager != nil {
+			if pid := entry.manager.PID(); pid > 0 {
+				total += sysinfo.TreePSS(pid)
+			}
+		}
+	}
+	if total > 768<<20 {
+		ttl = minDuration(ttl, 30*time.Second)
+	} else if total > 512<<20 {
+		ttl = minDuration(ttl, 2*time.Minute)
+	}
+	return ttl
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }

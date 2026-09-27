@@ -1,7 +1,11 @@
 package tasks
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,6 +47,61 @@ func TestProcessTaskLifecycleCapability(t *testing.T) {
 	t.Fatal("task did not complete")
 }
 
+func TestPersistentCompletedTaskSurvivesReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	pm := proc.NewManager()
+	res, err := pm.Start(proc.StartOptions{Command: "printf persisted-ok", Workdir: t.TempDir(), Yield: 10 * time.Millisecond, Env: proc.SanitizedEnv()})
+	if err != nil || res.SessionID == nil {
+		t.Fatalf("start: %+v %v", res, err)
+	}
+	m, err := NewPersistentManager(pm, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.CreateProcess(*res.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		got, _ := m.Get(task.TaskID)
+		if got.Status == "completed" {
+			m2, err := NewPersistentManager(proc.NewManager(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reloaded, err := m2.Get(task.TaskID)
+			if err != nil || reloaded.Status != "completed" || reloaded.Result == nil {
+				t.Fatalf("reloaded=%+v err=%v", reloaded, err)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("task did not complete")
+}
+
+func TestPersistedWorkingTaskFailsOnRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	now := time.Now().UTC()
+	task := &Task{TaskID: "task_00000000000000000000000000000001", Status: "working", StatusMessage: "running", CreatedAt: now.Format(time.RFC3339Nano), LastUpdatedAt: now.Format(time.RFC3339Nano)}
+	b, err := json.Marshal(persistedTasks{Version: 1, Tasks: map[string]*Task{task.TaskID: task}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewPersistentManager(proc.NewManager(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Get(task.TaskID)
+	if err != nil || got.Status != "failed" || !strings.Contains(got.StatusMessage, "restarted") {
+		t.Fatalf("restored=%+v err=%v", got, err)
+	}
+}
+
 func TestCancelTask(t *testing.T) {
 	pm := proc.NewManager()
 	res, err := pm.Start(proc.StartOptions{Command: "sleep 30", Workdir: t.TempDir(), Yield: 10 * time.Millisecond, Env: proc.SanitizedEnv()})
@@ -60,5 +119,61 @@ func TestCancelTask(t *testing.T) {
 	got, _ := m.Get(task.TaskID)
 	if got.Status != "cancelled" {
 		t.Fatalf("status=%s", got.Status)
+	}
+}
+
+func TestNonZeroProcessTaskFails(t *testing.T) {
+	pm := proc.NewManager()
+	res, err := pm.Start(proc.StartOptions{Command: "exit 7", Workdir: t.TempDir(), Yield: 10 * time.Millisecond, Env: proc.SanitizedEnv()})
+	if err != nil || res.SessionID == nil {
+		t.Fatalf("start: %+v %v", res, err)
+	}
+	m := NewManager(pm)
+	task, err := m.CreateProcess(*res.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, _ := m.Get(task.TaskID)
+		if got.Status != "working" {
+			if got.Status != "failed" || got.Error == nil || got.Result == nil {
+				t.Fatalf("task=%+v", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("task remained working")
+}
+
+func TestShutdownFailsWorkingTasks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	pm := proc.NewManager()
+	res, err := pm.Start(proc.StartOptions{Command: "sleep 30", Workdir: t.TempDir(), Yield: 10 * time.Millisecond, Env: proc.SanitizedEnv()})
+	if err != nil || res.SessionID == nil {
+		t.Fatalf("start: %+v %v", res, err)
+	}
+	m, err := NewPersistentManager(pm, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.CreateProcess(*res.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Shutdown()
+	got, err := m.Get(task.TaskID)
+	if err != nil || got.Status != "failed" || !strings.Contains(got.StatusMessage, "Daemon stopped") {
+		t.Fatalf("task=%+v err=%v", got, err)
+	}
+	_ = pm.Kill(*res.SessionID, syscall.SIGKILL)
+	m2, err := NewPersistentManager(proc.NewManager(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := m2.Get(task.TaskID)
+	if err != nil || reloaded.Status != "failed" {
+		t.Fatalf("reloaded=%+v err=%v", reloaded, err)
 	}
 }

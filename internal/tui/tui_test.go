@@ -6,8 +6,11 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ayush/cos-lite/internal/clientctx"
+	"github.com/ayush/cos-lite/internal/plugins"
+	"github.com/ayush/cos-lite/internal/sysinfo"
 	"github.com/ayush/cos-lite/internal/telemetry"
 )
 
@@ -96,5 +99,49 @@ func TestActivityViewRendersToolAndOutput(t *testing.T) {
 	m.handle(key{kind: "up"})
 	if m.activityOffset != 0 { // one event, so there is nowhere older to move.
 		t.Fatalf("activity offset=%d", m.activityOffset)
+	}
+}
+
+func TestMCPHealthViewRendersStates(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := plugins.WriteHealth([]plugins.ServerHealth{
+		{Name: "context7", State: "running", PID: 123, ToolCount: 2, Calls: 4},
+		{Name: "broken", State: "error", LastError: "missing executable"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	renderMCPHealth(&b, 100, 30)
+	got := b.String()
+	for _, want := range []string{"Codex MCP server health", "context7", "running", "broken", "missing executable"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("health view missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestResourceViewAndSparkline(t *testing.T) {
+	m := &Model{
+		resourceCurrent: sysinfo.Snapshot{
+			RootPID: 42, TotalPSS: 64 << 20, TotalRSS: 80 << 20, TotalCPU: 3.5,
+			Memory:    sysinfo.Memory{AvailableBytes: 4 << 30, Pressure: sysinfo.PressureNormal},
+			Groups:    []sysinfo.Group{{Kind: "daemon", Count: 1, PSSBytes: 12 << 20, RSSBytes: 14 << 20, CPU: 0.2}},
+			Processes: []sysinfo.Process{{PID: 42, Kind: "daemon", Label: "cos-lite", PSSBytes: 12 << 20, CPU: 0.2}},
+		},
+		resourceHistory: []resourcePoint{{pss: 60 << 20, cpu: 1}, {pss: 64 << 20, cpu: 3.5}},
+	}
+	var b strings.Builder
+	renderResources(&b, m, 100, 30)
+	got := b.String()
+	for _, want := range []string{"Runtime resources", "64.0 MiB", "daemon", "cos-lite", "Live 1s sampling"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("resource view missing %q:\n%s", want, got)
+		}
+	}
+	if got := sparkline([]float64{1, 2, 3, 4}, 4); len([]rune(got)) != 4 {
+		t.Fatalf("sparkline=%q", got)
+	}
+	if got := humanAge(65 * time.Second); got != "1m ago" {
+		t.Fatalf("age=%q", got)
 	}
 }

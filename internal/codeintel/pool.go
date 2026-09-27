@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ayush/cos-lite/internal/sysinfo"
 )
 
 const DefaultPoolIdleTTL = 5 * time.Minute
@@ -164,12 +166,13 @@ func (p *Pool) reaper() {
 
 func (p *Pool) evictIdle(now time.Time) {
 	p.mu.Lock()
+	ttl := p.adaptiveTTLLocked()
 	candidates := make([]struct {
 		key   string
 		entry *poolEntry
 	}, 0)
 	for key, entry := range p.entries {
-		if entry == nil || entry.proc == nil || entry.proc.exited() || now.Sub(entry.lastUsed) >= p.idleTTL {
+		if entry == nil || entry.proc == nil || entry.proc.exited() || now.Sub(entry.lastUsed) >= ttl {
 			candidates = append(candidates, struct {
 				key   string
 				entry *poolEntry
@@ -184,7 +187,7 @@ func (p *Pool) evictIdle(now time.Time) {
 		candidate.entry.useMu.Lock()
 		p.mu.Lock()
 		current := p.entries[candidate.key]
-		remove := current == candidate.entry && (candidate.entry.proc == nil || candidate.entry.proc.exited() || now.Sub(candidate.entry.lastUsed) >= p.idleTTL)
+		remove := current == candidate.entry && (candidate.entry.proc == nil || candidate.entry.proc.exited() || now.Sub(candidate.entry.lastUsed) >= ttl)
 		if remove {
 			delete(p.entries, candidate.key)
 		}
@@ -194,4 +197,35 @@ func (p *Pool) evictIdle(now time.Time) {
 		}
 		candidate.entry.useMu.Unlock()
 	}
+}
+
+func (p *Pool) adaptiveTTLLocked() time.Duration {
+	ttl := p.idleTTL
+	switch sysinfo.MemoryStatus().Pressure {
+	case sysinfo.PressureCritical:
+		ttl = minPoolDuration(ttl, 30*time.Second)
+	case sysinfo.PressureElevated:
+		ttl = minPoolDuration(ttl, 2*time.Minute)
+	}
+	var total uint64
+	for _, entry := range p.entries {
+		if entry != nil && entry.proc != nil {
+			if pid := entry.proc.pid(); pid > 0 {
+				total += sysinfo.TreePSS(pid)
+			}
+		}
+	}
+	if total > 768<<20 {
+		ttl = minPoolDuration(ttl, 15*time.Second)
+	} else if total > 512<<20 {
+		ttl = minPoolDuration(ttl, time.Minute)
+	}
+	return ttl
+}
+
+func minPoolDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }

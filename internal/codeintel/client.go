@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ayush/cos-lite/internal/managedproc"
 	proc "github.com/ayush/cos-lite/internal/process"
 	"github.com/ayush/cos-lite/internal/workspace"
 )
@@ -417,7 +418,7 @@ func startLSP(ctx context.Context, argv []string, cwd string) (*lspProc, error) 
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
-	cmd.Env = proc.SanitizedEnv()
+	cmd.Env = managedproc.ManagedEnv(proc.SanitizedEnv(), "lsp", filepath.Base(argv[0]), os.Getpid())
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	in, err := cmd.StdinPipe()
 	if err != nil {
@@ -432,14 +433,26 @@ func startLSP(ctx context.Context, argv []string, cwd string) (*lspProc, error) 
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	if err := managedproc.Register(cmd.Process.Pid, os.Getpid(), "lsp", filepath.Base(argv[0])); err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		return nil, fmt.Errorf("register LSP process: %w", err)
+	}
 	go func() {
 		err := cmd.Wait()
+		managedproc.Unregister(cmd.Process.Pid)
 		lp.waitMu.Lock()
 		lp.waitErr = err
 		lp.waitMu.Unlock()
 		close(lp.done)
 	}()
 	return lp, nil
+}
+
+func (p *lspProc) pid() int {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil || p.exited() {
+		return 0
+	}
+	return p.cmd.Process.Pid
 }
 func (p *lspProc) close() {
 	if p.cmd == nil {
@@ -466,7 +479,7 @@ func (p *lspProc) close() {
 }
 func (p *lspProc) initializeContext(ctx context.Context, root string) error {
 	caps := map[string]any{"textDocument": map[string]any{"definition": map[string]any{}, "references": map[string]any{}, "hover": map[string]any{}, "documentSymbol": map[string]any{}, "implementation": map[string]any{}, "rename": map[string]any{}, "diagnostic": map[string]any{}}, "workspace": map[string]any{"symbol": map[string]any{}}}
-	_, err := p.requestContext(ctx, "initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.1"}})
+	_, err := p.requestContext(ctx, "initialize", map[string]any{"processId": os.Getpid(), "rootUri": fileURI(root), "capabilities": caps, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.7.0"}})
 	if err != nil {
 		return err
 	}

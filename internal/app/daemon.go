@@ -22,6 +22,7 @@ import (
 	"github.com/ayush/cos-lite/internal/clientctx"
 	"github.com/ayush/cos-lite/internal/config"
 	"github.com/ayush/cos-lite/internal/control"
+	"github.com/ayush/cos-lite/internal/managedproc"
 	"github.com/ayush/cos-lite/internal/mcp"
 	"github.com/ayush/cos-lite/internal/plugins"
 	"github.com/ayush/cos-lite/internal/service"
@@ -56,13 +57,21 @@ func RunDaemon(ctx context.Context, version string) error {
 		return err
 	}
 	defer control.RemoveRuntime()
+	if report, err := managedproc.CleanupStale(os.Getpid()); err != nil {
+		log.Printf("stale process cleanup failed: %v", err)
+	} else if len(report.Killed)+len(report.Legacy)+len(report.Pruned) > 0 {
+		log.Printf("stale process cleanup: killed=%d legacy_browser=%d pruned=%d", len(report.Killed), len(report.Legacy), len(report.Pruned))
+	}
 
 	recorder, err := telemetry.New()
 	if err != nil {
 		return err
 	}
 	defer recorder.Close()
-	svc := newDaemonServices(recorder)
+	svc, err := newDaemonServices(recorder)
+	if err != nil {
+		return err
+	}
 	defer svc.shutdown()
 
 	var runtimeMu sync.RWMutex
@@ -93,6 +102,27 @@ func RunDaemon(ctx context.Context, version string) error {
 		return err
 	}
 	current = bundle
+	writeMCPHealth := func() {
+		runtimeMu.RLock()
+		b := current
+		runtimeMu.RUnlock()
+		if b != nil && b.plugins != nil {
+			if err := plugins.WriteHealth(b.plugins.Health()); err != nil {
+				log.Printf("write MCP health: %v", err)
+			}
+		}
+	}
+	writeMCPHealth()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-svc.healthChanges:
+				writeMCPHealth()
+			}
+		}
+	}()
 	defer func() {
 		runtimeMu.RLock()
 		last := current
@@ -212,6 +242,7 @@ func RunDaemon(ctx context.Context, version string) error {
 			appliedCfg = candidate
 			runtimeMu.Unlock()
 			srv.Update(newBundle.registry, newBundle.resources, newBundle.instructionText)
+			writeMCPHealth()
 			if oldCfg.Tunnel != candidate.Tunnel || keyChanged {
 				tm.Stop()
 				if err := tm.Start(ctx, candidate.Tunnel, endpoint); err != nil {

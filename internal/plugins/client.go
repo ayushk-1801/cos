@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/ayush/cos-lite/internal/managedproc"
 )
 
 type Config struct {
@@ -94,7 +96,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	for _, key := range keys {
 		env = append(env, key+"="+envMap[key])
 	}
-	cmd.Env = env
+	cmd.Env = managedproc.ManagedEnv(env, "mcp", cfg.Name, os.Getpid())
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -110,6 +112,10 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	if err := managedproc.Register(cmd.Process.Pid, os.Getpid(), "mcp", cfg.Name); err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		return nil, fmt.Errorf("register MCP process: %w", err)
+	}
 	c := &Client{cfg: cfg, cmd: cmd, stdin: stdin, pending: make(map[int64]chan reply), closed: make(chan struct{}), protocol: "2026-07-28"}
 	go c.readLoop(stdout)
 	go func() {
@@ -118,7 +124,11 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 			log.Printf("plugin %s: %s", cfg.Name, s.Text())
 		}
 	}()
-	go func() { err := cmd.Wait(); c.failAll(fmt.Errorf("plugin %s exited: %v", cfg.Name, err)) }()
+	go func() {
+		err := cmd.Wait()
+		managedproc.Unregister(cmd.Process.Pid)
+		c.failAll(fmt.Errorf("plugin %s exited: %v", cfg.Name, err))
+	}()
 	return c, nil
 }
 
@@ -181,6 +191,12 @@ func (c *Client) Prefix() string {
 	return c.cfg.Name + "."
 }
 func (c *Client) Name() string { return c.cfg.Name }
+func (c *Client) PID() int {
+	if c == nil || c.cmd == nil || c.cmd.Process == nil || c.Closed() {
+		return 0
+	}
+	return c.cmd.Process.Pid
+}
 
 func (c *Client) readLoop(r io.Reader) {
 	s := bufio.NewScanner(r)
@@ -275,7 +291,7 @@ func (c *Client) notify(method string, params any) error {
 }
 
 func currentMeta() map[string]any {
-	return map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.1"}, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}}
+	return map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": map[string]any{"name": "cos-lite", "version": "0.7.0"}, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}}
 }
 
 func (c *Client) Discover(ctx context.Context) ([]map[string]any, error) {
@@ -302,7 +318,7 @@ func (c *Client) Discover(ctx context.Context) ([]map[string]any, error) {
 		// deliberately advertise only legacy revisions, so a successful discovery call
 		// is not by itself proof that 2026-07-28 is usable.
 		c.protocol = "2025-11-25"
-		params := map[string]any{"protocolVersion": c.protocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.6.1"}}
+		params := map[string]any{"protocolVersion": c.protocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "cos-lite", "version": "0.7.0"}}
 		raw, re, e := c.request(ctx, "initialize", params)
 		if e != nil {
 			return nil, e

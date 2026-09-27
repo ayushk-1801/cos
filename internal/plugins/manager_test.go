@@ -74,3 +74,18 @@ args = ["hello"]
 		t.Fatalf("cfg=%#v warnings=%#v", cfg, warnings)
 	}
 }
+
+func TestHealthFileRoundTrip(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	in := []ServerHealth{{Name: "fake", State: "running", PID: 123, ToolCount: 4, Calls: 7, Failures: 1, LastError: "boom"}}
+	if err := WriteHealth(in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadHealth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Servers) != 1 || got.Servers[0].Name != "fake" || got.Servers[0].Calls != 7 || got.Servers[0].ToolCount != 4 {
+		t.Fatalf("health=%+v", got)
+	}
+}

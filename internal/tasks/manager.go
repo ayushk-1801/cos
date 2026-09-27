@@ -3,8 +3,12 @@ package tasks
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +20,8 @@ import (
 const (
 	DefaultTTL          = 24 * time.Hour
 	DefaultPollInterval = time.Second
+	maxPersistedTasks   = 256
+	maxTaskStateBytes   = 8 << 20
 )
 
 type Task struct {
@@ -35,15 +41,31 @@ type Task struct {
 }
 
 type Manager struct {
-	mu    sync.RWMutex
-	pm    *proc.Manager
-	tasks map[string]*Task
+	mu      sync.RWMutex
+	pm      *proc.Manager
+	tasks   map[string]*Task
+	path    string
+	loadErr error
 }
 
 func NewManager(pm *proc.Manager) *Manager {
-	m := &Manager{pm: pm, tasks: map[string]*Task{}}
-	go m.reaper()
+	m, _ := newManager(pm, "")
 	return m
+}
+
+func NewPersistentManager(pm *proc.Manager, path string) (*Manager, error) {
+	return newManager(pm, path)
+}
+
+func newManager(pm *proc.Manager, path string) (*Manager, error) {
+	m := &Manager{pm: pm, tasks: map[string]*Task{}, path: strings.TrimSpace(path)}
+	if m.path != "" {
+		if err := m.load(); err != nil {
+			return nil, err
+		}
+	}
+	go m.reaper()
+	return m, nil
 }
 
 func (m *Manager) CreateProcess(sessionID string) (Task, error) {
@@ -63,6 +85,11 @@ func (m *Manager) CreateProcess(sessionID string) (Task, error) {
 	}
 	m.mu.Lock()
 	m.tasks[id] = t
+	if err := m.saveLocked(); err != nil {
+		delete(m.tasks, id)
+		m.mu.Unlock()
+		return Task{}, err
+	}
 	m.mu.Unlock()
 	go m.watch(t)
 	return cloneTask(t), nil
@@ -99,6 +126,7 @@ func (m *Manager) Cancel(id string) error {
 	m.mu.Lock()
 	if current := m.tasks[id]; current != nil && current.Status == "working" {
 		m.setStatusLocked(current, "cancelled", "Cancellation requested.", nil, nil)
+		_ = m.saveLocked()
 	}
 	m.mu.Unlock()
 	return nil
@@ -111,6 +139,7 @@ func (m *Manager) watch(t *Task) {
 			m.mu.Lock()
 			if current := m.tasks[t.TaskID]; current != nil && current.Status == "working" {
 				m.setStatusLocked(current, "failed", "Task polling failed.", nil, map[string]any{"code": -32603, "message": err.Error()})
+				_ = m.saveLocked()
 			}
 			m.mu.Unlock()
 			return
@@ -128,9 +157,39 @@ func (m *Manager) watch(t *Task) {
 			return
 		}
 		payload := processResultPayload(res)
-		m.setStatusLocked(current, "completed", "Command completed.", payload, nil)
+		if res.ExitCode != nil && *res.ExitCode != 0 {
+			m.setStatusLocked(current, "failed", "Command failed.", payload, map[string]any{
+				"code": -32603, "message": fmt.Sprintf("command exited with code %d", *res.ExitCode),
+			})
+		} else {
+			m.setStatusLocked(current, "completed", "Command completed.", payload, nil)
+		}
+		_ = m.saveLocked()
 		m.mu.Unlock()
 		return
+	}
+}
+
+// Shutdown persists a terminal state for work that cannot survive this daemon
+// process. This runs before service teardown so a graceful restart never turns
+// an interrupted command into a misleading successful Task.
+func (m *Manager) Shutdown() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := false
+	for _, task := range m.tasks {
+		if task != nil && task.Status == "working" {
+			m.setStatusLocked(task, "failed", "Daemon stopped before task completed.", nil, map[string]any{
+				"code": -32603, "message": "cos-lite daemon stopped before the task completed",
+			})
+			changed = true
+		}
+	}
+	if changed {
+		_ = m.saveLocked()
 	}
 }
 
@@ -204,11 +263,118 @@ func (m *Manager) reaper() {
 	for range ticker.C {
 		cutoff := time.Now().Add(-DefaultTTL)
 		m.mu.Lock()
+		changed := false
 		for id, task := range m.tasks {
 			if task.Status != "working" && task.created.Before(cutoff) {
 				delete(m.tasks, id)
+				changed = true
 			}
+		}
+		if changed {
+			_ = m.saveLocked()
 		}
 		m.mu.Unlock()
 	}
+}
+
+type persistedTasks struct {
+	Version int              `json:"version"`
+	Tasks   map[string]*Task `json:"tasks"`
+}
+
+func (m *Manager) load() error {
+	b, err := os.ReadFile(m.path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(b) > maxTaskStateBytes {
+		return fmt.Errorf("task state exceeds %d bytes", maxTaskStateBytes)
+	}
+	var disk persistedTasks
+	if err := json.Unmarshal(b, &disk); err != nil {
+		return fmt.Errorf("parse persisted tasks: %w", err)
+	}
+	if disk.Version != 0 && disk.Version != 1 {
+		return fmt.Errorf("unsupported task state version %d", disk.Version)
+	}
+	now := time.Now().UTC()
+	for id, task := range disk.Tasks {
+		if task == nil || task.TaskID != id {
+			continue
+		}
+		task.created, _ = time.Parse(time.RFC3339Nano, task.CreatedAt)
+		task.updated, _ = time.Parse(time.RFC3339Nano, task.LastUpdatedAt)
+		if task.created.IsZero() {
+			task.created = now
+		}
+		if task.updated.IsZero() {
+			task.updated = task.created
+		}
+		task.sessionID = ""
+		if task.Status == "working" {
+			m.setStatusLocked(task, "failed", "Daemon restarted before task completed.", nil, map[string]any{
+				"code": -32603, "message": "cos-lite daemon restarted before the task completed",
+			})
+		}
+		m.tasks[id] = task
+	}
+	m.pruneLocked()
+	return m.saveLocked()
+}
+
+func (m *Manager) saveLocked() error {
+	if m.path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(m.path), 0o700); err != nil {
+		return err
+	}
+	disk := persistedTasks{Version: 1, Tasks: m.tasks}
+	b, err := json.MarshalIndent(disk, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(b) > maxTaskStateBytes {
+		return fmt.Errorf("task state exceeds %d bytes", maxTaskStateBytes)
+	}
+	b = append(b, '\n')
+	tmp := m.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, m.path)
+}
+
+func (m *Manager) pruneLocked() {
+	if len(m.tasks) <= maxPersistedTasks {
+		return
+	}
+	type pair struct {
+		id string
+		t  time.Time
+	}
+	var items []pair
+	for id, task := range m.tasks {
+		if task.Status != "working" {
+			items = append(items, pair{id: id, t: task.updated})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].t.Before(items[j].t) })
+	for len(m.tasks) > maxPersistedTasks && len(items) > 0 {
+		delete(m.tasks, items[0].id)
+		items = items[1:]
+	}
+}
+
+func (m *Manager) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.tasks)
 }

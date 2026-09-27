@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/ayush/cos-lite/internal/clientctx"
 	"github.com/ayush/cos-lite/internal/codeintel"
 	"github.com/ayush/cos-lite/internal/config"
+	"github.com/ayush/cos-lite/internal/control"
 	"github.com/ayush/cos-lite/internal/instructions"
 	planpkg "github.com/ayush/cos-lite/internal/plan"
 	"github.com/ayush/cos-lite/internal/plugins"
@@ -24,20 +26,43 @@ import (
 )
 
 type daemonServices struct {
-	pm        *proc.Manager
-	plans     *planpkg.Store
-	tasks     *taskpkg.Manager
-	telemetry *telemetry.Recorder
-	lspPool   *codeintel.Pool
+	pm            *proc.Manager
+	plans         *planpkg.Store
+	tasks         *taskpkg.Manager
+	telemetry     *telemetry.Recorder
+	lspPool       *codeintel.Pool
+	healthChanges chan struct{}
 
 	browserMu       sync.Mutex
 	browserPool     *browser.Pool
 	browserHeadless bool
 }
 
-func newDaemonServices(rec *telemetry.Recorder) *daemonServices {
+func newDaemonServices(rec *telemetry.Recorder) (*daemonServices, error) {
 	pm := proc.NewManager()
-	return &daemonServices{pm: pm, plans: &planpkg.Store{}, tasks: taskpkg.NewManager(pm), telemetry: rec, lspPool: codeintel.NewPool(codeintel.DefaultPoolIdleTTL)}
+	stateDir, err := control.Dir()
+	if err != nil {
+		return nil, err
+	}
+	plans, err := planpkg.NewPersistent(filepath.Join(stateDir, "plans.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load persisted plans: %w", err)
+	}
+	tasks, err := taskpkg.NewPersistentManager(pm, filepath.Join(stateDir, "tasks.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load persisted tasks: %w", err)
+	}
+	return &daemonServices{pm: pm, plans: plans, tasks: tasks, telemetry: rec, lspPool: codeintel.NewPool(codeintel.DefaultPoolIdleTTL), healthChanges: make(chan struct{}, 1)}, nil
+}
+
+func (s *daemonServices) signalHealth() {
+	if s == nil || s.healthChanges == nil {
+		return
+	}
+	select {
+	case s.healthChanges <- struct{}{}:
+	default:
+	}
 }
 
 func (s *daemonServices) browsers(enabled, headless bool) *browser.Pool {
@@ -70,6 +95,9 @@ func (s *daemonServices) browsers(enabled, headless bool) *browser.Pool {
 }
 
 func (s *daemonServices) shutdown() {
+	if s.tasks != nil {
+		s.tasks.Shutdown()
+	}
 	s.browserMu.Lock()
 	p := s.browserPool
 	s.browserPool = nil
@@ -146,7 +174,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, svc *daemonServices, s
 		}
 	}
 
-	pluginManager := &plugins.Manager{}
+	pluginManager := plugins.NewManager(svc.signalHealth)
 	pluginCfg, pluginWarnings, err := plugins.LoadCodexConfig()
 	if err != nil {
 		return nil, err

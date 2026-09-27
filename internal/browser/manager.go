@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/ayush/cos-lite/internal/managedproc"
 )
 
 type Tab struct {
@@ -97,10 +99,15 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	// Keep the dedicated browser in its own Linux process group so shutdown also
 	// reaches Chromium renderer/GPU/helper children rather than only the browser parent.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = managedproc.ManagedEnv(os.Environ(), "browser", m.profileKey, os.Getpid())
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		return err
+	}
+	if err := managedproc.Register(cmd.Process.Pid, os.Getpid(), "browser", m.profileKey); err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		return fmt.Errorf("register browser process: %w", err)
 	}
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	deadline := time.Now().Add(10 * time.Second)
@@ -109,13 +116,29 @@ func (m *Manager) Ensure(ctx context.Context) error {
 			m.cmd = cmd
 			m.base = base
 			m.profile = profile
-			go cmd.Wait()
+			go func() {
+				_ = cmd.Wait()
+				managedproc.Unregister(cmd.Process.Pid)
+			}()
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	_ = cmd.Process.Kill()
+	managedproc.Unregister(cmd.Process.Pid)
 	return errors.New("Chromium remote debugging endpoint did not start")
+}
+
+func (m *Manager) PID() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cmd == nil || m.cmd.Process == nil || m.base == "" {
+		return 0
+	}
+	return m.cmd.Process.Pid
 }
 
 func ping(base string) error {
