@@ -87,14 +87,9 @@ func (m *Manager) Start(opts StartOptions) (Result, error) {
 		opts.MaxOutput = DefaultMaxOutput
 	}
 
-	var cmd *exec.Cmd
-	if opts.TTY {
-		if _, err := exec.LookPath("script"); err != nil {
-			return Result{}, fmt.Errorf("tty requested but util-linux 'script' is unavailable: %w", err)
-		}
-		cmd = exec.Command("script", "-qefc", opts.Command, "/dev/null")
-	} else {
-		cmd = exec.Command("bash", "-lc", opts.Command)
+	cmd, err := shellCommand(opts.Command, opts.TTY)
+	if err != nil {
+		return Result{}, err
 	}
 	cmd.Dir = opts.Workdir
 	cmd.Env = opts.Env
@@ -383,7 +378,7 @@ func augmentedPATH(base string) string {
 			filepath.Join(home, ".cargo", "bin"),
 		)
 	}
-	candidates = append(candidates, "/usr/local/go/bin")
+	candidates = append(candidates, "/usr/local/go/bin", "/opt/homebrew/bin", "/usr/local/bin")
 	candidates = append(candidates, filepath.SplitList(base)...)
 	seen := map[string]bool{}
 	out := make([]string, 0, len(candidates))

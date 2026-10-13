@@ -190,7 +190,7 @@ func RunDaemon(ctx context.Context, version string) error {
 	codexPath, _ := plugins.CodexConfigPath()
 	watchCh, watchErr := watch.Files(ctx, configPath, keyPath, codexPath)
 	if watchErr != nil {
-		log.Printf("config watcher: inotify unavailable, using 30s checksum fallback: %v", watchErr)
+		log.Printf("config watcher unavailable, using 30s checksum fallback: %v", watchErr)
 	}
 	go func() {
 		lastDigest := initialDigest
@@ -400,13 +400,12 @@ func Start(binary string) error {
 	if len(cfg.EnabledProjects()) == 0 {
 		return fmt.Errorf("no enabled projects")
 	}
-	if service.Enabled() {
+	if service.Enabled() && service.Available() {
 		if service.Active() {
 			return nil
 		}
-		cmd := exec.Command("systemctl", "--user", "start", "cos-lite.service")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("systemctl start: %v: %s", err, strings.TrimSpace(string(out)))
+		if err := service.Start(); err != nil {
+			return err
 		}
 		return waitStarted(4 * time.Second)
 	}
@@ -463,7 +462,7 @@ func Stop() error {
 	return nil
 }
 func Restart(binary string) error {
-	if service.Enabled() {
+	if service.Enabled() && service.Available() {
 		if !service.Active() {
 			return service.Install(binary)
 		}
@@ -527,7 +526,7 @@ func Reconcile(binary string, cfg config.Config) error {
 			return nil
 		}
 		// Migrate a daemon that was started directly (for example by v0.2) before
-		// handing ownership to systemd; otherwise both processes can race for the port.
+		// handing ownership to the platform service; otherwise both processes can race for the port.
 		if !service.Enabled() {
 			if _, running := control.Running(); running {
 				if err := Stop(); err != nil {

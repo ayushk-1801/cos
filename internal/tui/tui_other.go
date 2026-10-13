@@ -1,7 +1,9 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package tui
 
 import "fmt"
 
-func Run(binary string) error { return fmt.Errorf("the cos-lite TUI currently supports Linux only") }
+func Run(binary string) error {
+	return fmt.Errorf("the cos-lite TUI currently supports Linux and macOS only")
+}

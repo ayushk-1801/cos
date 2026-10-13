@@ -121,7 +121,7 @@ func run(args []string) error {
 }
 
 func printHelp(w io.Writer) {
-	fmt.Fprint(w, `cos-lite - Ubuntu-first local MCP tools
+	fmt.Fprint(w, `cos-lite - Linux/macOS local MCP tools
 
 Usage:
   cos                         Open the TUI
@@ -179,7 +179,11 @@ func doctor() error {
 	} else {
 		fmt.Printf("[optional] JavaScript exec sandbox unavailable (%v); declarative exec calls still work\n", err)
 	}
-	check("browser", []string{"chromium", "chromium-browser", "google-chrome", "google-chrome-stable"}, false)
+	if binary, err := browser.FindBrowserExecutable(); err == nil {
+		fmt.Printf("[ok] %-12s %s\n", "browser", binary)
+	} else {
+		fmt.Printf("[optional] browser unavailable (%v)\n", err)
+	}
 	if p, err := tunnelpkg.FindBinary("tunnel-client"); err == nil {
 		fmt.Printf("[ok] %-12s %s\n", "OpenAI tunnel", p)
 	} else {
@@ -190,7 +194,11 @@ func doctor() error {
 	} else {
 		fmt.Println("[optional] Cloudflare not found (cloudflared)")
 	}
-	check("systemd", []string{"systemctl"}, false)
+	if service.Available() {
+		fmt.Printf("[ok] %-12s available\n", map[bool]string{true: "launchd", false: "systemd"}[runtime.GOOS == "darwin"])
+	} else {
+		fmt.Println("[optional] user service unavailable; daemon can run directly")
+	}
 	servers := codeintel.AvailableServers()
 	showLSP := func(label, id, hint string) {
 		if p := servers[id]; p != "" {
@@ -216,7 +224,11 @@ func doctor() error {
 		fmt.Println("[info] OTLP tracing disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
 	}
 	cfg, _ := config.Load()
-	fmt.Printf("[info] autostart policy=%v; linger=%v\n", cfg.Autostart, service.LingerEnabled())
+	if runtime.GOOS == "darwin" {
+		fmt.Printf("[info] autostart policy=%v (macOS login LaunchAgent)\n", cfg.Autostart)
+	} else {
+		fmt.Printf("[info] autostart policy=%v; linger=%v\n", cfg.Autostart, service.LingerEnabled())
+	}
 	for _, p := range cfg.EnabledProjects() {
 		st, err := os.Stat(p.Path)
 		if err != nil {
@@ -318,21 +330,9 @@ func probeMCPEndpoint(endpoint string) error {
 }
 
 func duplicateOpenAITunnelProcesses(tunnelID string) int {
-	tunnelID = strings.TrimSpace(tunnelID)
-	if tunnelID == "" {
+	count, err := tunnelpkg.CountTunnelIDProcesses(tunnelID)
+	if err != nil {
 		return 0
-	}
-	entries, _ := os.ReadDir("/proc")
-	count := 0
-	needle := "--control-plane.tunnel-id=" + tunnelID
-	for _, e := range entries {
-		if _, err := strconv.Atoi(e.Name()); err != nil {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err == nil && strings.Contains(strings.ReplaceAll(string(b), "\x00", " "), needle) {
-			count++
-		}
 	}
 	return count
 }
@@ -855,7 +855,11 @@ func serviceCommand(binary string, args []string) error {
 		fmt.Printf("policy: %v\n", cfg.Autostart)
 		fmt.Printf("enabled: %v\n", service.Enabled())
 		fmt.Printf("active: %v\n", service.Active())
-		fmt.Printf("linger: %v\n", service.LingerEnabled())
+		if runtime.GOOS == "linux" {
+			fmt.Printf("linger: %v\n", service.LingerEnabled())
+		} else {
+			fmt.Println("startup: at user login (launchd)")
+		}
 		return nil
 	case "enable":
 		cfg.Autostart = true
@@ -863,7 +867,7 @@ func serviceCommand(binary string, args []string) error {
 			return err
 		}
 		if len(cfg.EnabledProjects()) == 0 {
-			fmt.Println("autostart policy enabled; the systemd unit will be installed when you add the first project")
+			fmt.Println("autostart policy enabled; the user service will be installed when you add the first project")
 			return nil
 		}
 		return app.Reconcile(binary, cfg)
@@ -1095,7 +1099,7 @@ func buildRegistry(ctx context.Context, ws *workspace.Workspace, opts serveOptio
 		_ = recorder.Close()
 	}
 	instructionProvider := func(context.Context) string {
-		text := "Ubuntu-first local coding tools. Approved project roots: " + ws.RootSummary() + "."
+		text := "Linux/macOS local coding tools. Approved project roots: " + ws.RootSummary() + "."
 		if agents := resolver.ServerText(); agents != "" {
 			text += "\n\n# Project instructions (AGENTS.md)\n" + agents
 		}

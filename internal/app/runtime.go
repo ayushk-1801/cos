@@ -223,7 +223,7 @@ func (r *runtimeBundle) instructionText(_ context.Context) string {
 	}
 	defer r.instructionMu.Unlock()
 	var b strings.Builder
-	fmt.Fprintf(&b, "Ubuntu-first local coding tools. Approved project roots: %s. With multiple projects, use /<project>/... paths explicitly.", r.ws.RootSummary())
+	fmt.Fprintf(&b, "Linux/macOS local coding tools. Approved project roots: %s. With multiple projects, use /<project>/... paths explicitly.", r.ws.RootSummary())
 	if rootAgents := r.instructions.ServerText(); rootAgents != "" {
 		b.WriteString("\n\n# Project instructions (AGENTS.md)\n")
 		b.WriteString(rootAgents)

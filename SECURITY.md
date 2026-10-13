@@ -14,9 +14,9 @@
 - File tools resolve symlinks and reject paths that escape the selected root.
 - Mutating file operations reject a final symlink.
 - Child command and LSP environments strip common LLM/MCP API secrets.
-- Long-running commands use their own Linux process group so timeout/cancellation reaches descendants.
+- Long-running commands use their own Unix process group so timeout/cancellation reaches descendants.
 - Stateful terminal, plan, browser, and Task workflows use cryptographically random opaque capability handles. MCP `clientInfo` and connector conversation metadata are not treated as authentication boundaries.
-- JavaScript `exec` uses Node's permission model plus Linux user/network/PID namespaces and fails closed when the namespace sandbox is unavailable.
+- On Linux, JavaScript `exec` uses Node's permission model plus Linux namespaces or systemd seccomp, and fails closed without isolation. On macOS, JavaScript code mode is disabled; declarative calls remain available.
 - Chromium control uses isolated browser contexts with dedicated profiles and loopback CDP ports; no browser extension is installed.
 - Daemon status output redacts the local MCP token. `cos endpoint` intentionally reveals the usable URL on request.
 - OTLP traces and `audit.jsonl` contain operational metadata only. TUI output previews are kept separately in local `activity.jsonl` (mode `0600`), are bounded/redacted, and are never exported through OTLP by default.
@@ -61,7 +61,7 @@ Tunnel URLs and MCP path tokens should be treated like passwords. Do not paste t
 
 ## Automatic startup
 
-The default policy enables a systemd user service after the first project is added. `cos-lite` makes a best-effort `loginctl enable-linger` call so the service can start at boot before login. This does not grant root privileges to the daemon; the service still runs as your user.
+The default policy enables a Linux systemd user service or macOS user LaunchAgent after the first project is added. On Linux `cos-lite` makes a best-effort `loginctl enable-linger` call to start before login when permitted. On macOS the LaunchAgent starts on GUI login. Neither service requires root privileges.
 
 Disable automatic startup with:
 

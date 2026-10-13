@@ -6,51 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/ayush/cos-lite/internal/config"
 )
-
-func FindTunnelIDCollision(tunnelID string) (int, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, err
-	}
-	self := os.Getpid()
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid <= 0 || pid == self {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-		if err != nil || len(b) == 0 {
-			continue
-		}
-		parts := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
-		if len(parts) == 0 || !strings.Contains(filepath.Base(parts[0]), "tunnel-client") {
-			continue
-		}
-		if tunnelIDFromArgv(parts) == tunnelID {
-			// Ignore a child left over from this daemon's immediately preceding
-			// manager instance; Stop() has already signaled it and it may take a
-			// moment to disappear from /proc.
-			if ppid, e := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat")); e == nil {
-				fields := strings.Fields(string(ppid))
-				if len(fields) > 3 {
-					if parent, _ := strconv.Atoi(fields[3]); parent == self {
-						continue
-					}
-				}
-			}
-			return pid, nil
-		}
-	}
-	return 0, nil
-}
 
 func tunnelIDFromArgv(args []string) string {
 	for i, arg := range args {
@@ -75,6 +34,8 @@ func FindBinary(name string) (string, error) {
 	for _, dir := range []string{
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
 	} {
 		candidate := filepath.Join(dir, name)
 		st, statErr := os.Stat(candidate)

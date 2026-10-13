@@ -64,15 +64,9 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		m.base = ""
 	}
 	defer m.mu.Unlock()
-	bin := ""
-	for _, name := range []string{"chromium", "chromium-browser", "google-chrome", "google-chrome-stable"} {
-		if p, err := exec.LookPath(name); err == nil {
-			bin = p
-			break
-		}
-	}
-	if bin == "" {
-		return errors.New("Chromium/Chrome not found; install with: sudo apt install chromium-browser (or chromium)")
+	bin, err := FindBrowserExecutable()
+	if err != nil {
+		return err
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

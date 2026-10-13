@@ -1,3 +1,5 @@
+//go:build linux
+
 package service
 
 import (
@@ -110,6 +112,13 @@ func Restart() error {
 	out, err := exec.Command("systemctl", "--user", "restart", unitName).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl restart: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+func Start() error {
+	out, err := exec.Command("systemctl", "--user", "start", unitName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl start: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

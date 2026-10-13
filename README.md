@@ -1,20 +1,48 @@
 # cos-lite
 
-A lightweight, Ubuntu-first MCP bridge with a terminal control plane.
+A lightweight Linux/macOS MCP bridge with a terminal control plane.
 
 `cos-lite` keeps the useful local-machine capabilities of Chat On Steroids without Electron, a browser extension, or ChatGPT conversation automation. The normal runtime is one small Go daemon. Running `cos` opens a dependency-free TUI for projects, tunnel setup, logs, browser tools, semantic code intelligence, skills, and daemon/autostart control.
 
 v0.5 adds stateless multi-chat isolation, hot configuration reload, MCP Tasks, MCP Resources, hierarchical `AGENTS.md` instructions, and lightweight audit/OpenTelemetry tracing without adding a second daemon or a large dependency tree. v0.5.2 adds a live TUI Activity view with local-only bounded tool-output previews. **v0.6 is a performance-focused release**: Linux inotify replaces sub-second config polling, state is written only when it changes, Code Intel reuses language-server processes with idle eviction, audit/activity disk writes are batched asynchronously, browser contexts are garbage-collected after inactivity, and Skills/AGENTS metadata gets short-lived caches.
 
+## macOS support (Intel and Apple Silicon)
+
+COS Lite supports macOS on both **Apple Silicon (arm64)** and **Intel (amd64)** using the same Go daemon, MCP tools, terminal dashboard, and configuration format as Linux. It is a command-line application, not an .app bundle; run it from Terminal or iTerm2. The service is a user LaunchAgent (starts at **login**, not before login). On Linux the service is a systemd user unit.
+
+For development from source (Go 1.23+):
+
+```bash
+make dist
+./install.sh
+cos project add ~/Projects/my-repo
+cos
+```
+
+Or install a published release using `./install-release.sh`. The release script selects `cos-darwin-arm64` or `cos-darwin-amd64` automatically and verifies the SHA-256 checksum using macOS `shasum`. To skip automatic service configuration use `COS_ENABLE_SERVICE=0`. `cos service enable/disable/status` controls the LaunchAgent; service availability requires an interactive GUI login session, so headless/SSH macOS sessions may need `cos daemon` directly.
+
+Optional macOS tools:
+
+```bash
+brew install ripgrep
+brew install openai/tools/tunnel-client
+```
+
+Chrome is discovered from the regular `/Applications` and `~/Applications` bundle locations, or PATH. Optional language servers can be installed using Homebrew/npm/Go/Rust as usual. Commands use macOS's BSD `script` utility for PTYs.
+
+**Security note:** On macOS, the isolated JavaScript `exec.code` mode is deliberately unavailable until a macOS sandbox with equivalent process/FS/network restrictions is implemented. The safer declarative `exec.calls` mode and all ordinary MCP tools still work; COS Lite never silently runs JavaScript without isolation.
+
+**Resource reporting:** macOS uses `ps`, `sysctl`, and `vm_stat`. macOS does not provide Linux proportional-set-size (PSS) through `/proc`, so the existing PSS display/fields use RSS as an estimate on Darwin. Memory pressure is heuristic rather than the system's precise pressure classification.
+
 ## What it looks like
 
 ```text
- cos-lite  Ubuntu MCP control plane
+ cos-lite  MCP control plane
 ────────────────────────────────────────────────────────────────────
 Daemon    ● running              pid 18422
 Tunnel    ● connected            https://example.trycloudflare.com/...
 Browser   enabled
-Autostart enabled (boot)
+Autostart enabled
 CodeIntel enabled (3 server families found)
 Skills    enabled (7 discovered)
 
@@ -291,19 +319,19 @@ The prebuilt binary needs no Go runtime.
 
 Required:
 
-- Ubuntu or another modern Linux distribution
+- Ubuntu/another modern Linux distribution, or macOS (Apple Silicon or Intel)
 - `bash`
 
 Optional:
 
 - `ripgrep` for faster large-repository search (`find` has a built-in fallback)
-- `script` from `util-linux` for PTY commands
-- Node.js 20+ plus either usable Linux user/network namespaces (`unshare`) or a user-systemd seccomp sandbox for JavaScript `exec`
+- `script` for PTY commands (util-linux on Linux, provided by macOS)
+- Linux only: Node.js 20+ plus usable namespaces (`unshare`) or a user-systemd seccomp sandbox for JavaScript `exec` (macOS safely disables this mode)
 - the relevant language server(s) for `code_intel`
 - Chromium/Chrome for browser tools
 - OpenAI `tunnel-client` for ChatGPT Secure MCP Tunnel
 - `cloudflared` for the built-in Cloudflare quick-tunnel option
-- a working `systemd --user` instance for persistent autostart
+- a working `systemd --user` on Linux, or a macOS GUI launchd session, for persistent autostart
 
 Ubuntu basics:
 
@@ -326,7 +354,7 @@ cos doctor
 curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | bash
 ```
 
-The installer detects `amd64`/`arm64`, downloads the latest GitHub Release binary, verifies it against `SHA256SUMS`, and installs `cos` to `~/.local/bin` by default. Pin a version with `COS_VERSION`, for example:
+Once the corresponding four-platform assets have been published, the installer detects Linux/macOS and `amd64`/`arm64`, downloads the matching GitHub Release binary, verifies it against `SHA256SUMS`, and installs `cos` to `~/.local/bin` by default. Pin a version with `COS_VERSION`, for example:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | COS_VERSION=0.7.0 bash
@@ -344,7 +372,8 @@ This installs `cos` to `~/.local/bin` by default and enables the default automat
 Or manually on x86-64:
 
 ```bash
-install -Dm755 dist/cos-linux-amd64 ~/.local/bin/cos
+mkdir -p ~/.local/bin
+install -m 0755 dist/cos-linux-amd64 ~/.local/bin/cos
 ```
 
 ## First run
@@ -355,9 +384,9 @@ Open the TUI:
 cos
 ```
 
-Press `a`, enter a project path, and press Enter. The project is persisted in `~/.config/cos-lite/config.json`.
+Press `a`, enter a project path, and press Enter. The project is persisted in `~/.config/cos-lite/config.json` on Linux, or `~/Library/Application Support/cos-lite/config.json` on macOS (unless `XDG_CONFIG_HOME` is set).
 
-**Autostart defaults on.** Adding the first enabled project automatically reconciles the background daemon. On Ubuntu with a working user systemd manager, `cos` installs/enables `cos-lite.service`. It also makes a best-effort call to `loginctl enable-linger`, which allows the user service to start during boot before login when system policy permits it. If lingering is unavailable, the service still starts with the user session/login.
+**Autostart defaults on.** Adding the first enabled project automatically reconciles the background daemon. On Ubuntu with a working user systemd manager, `cos` installs/enables `cos-lite.service`. It also makes a best-effort call to `loginctl enable-linger`, which allows the user service to start during boot before login when system policy permits it. If lingering is unavailable, the service still starts with the user session/login. On macOS, COS Lite installs `~/Library/LaunchAgents/ai.cos-lite.daemon.plist` and starts it at user login, not at boot.
 
 Check exactly which mode your machine is using:
 
@@ -470,7 +499,7 @@ cos tunnel set openai tunnel_0123456789abcdef0123456789abcdef
 cos tunnel status
 ```
 
-When this provider is active, the existing `cos-lite.service` manages both the MCP daemon and its `tunnel-client` child, so there is no second systemd service to maintain.
+When this provider is active, the existing Linux systemd unit or macOS LaunchAgent manages the MCP daemon and its `tunnel-client` child, so no second background service is necessary.
 
 One OpenAI `tunnel_id` must have only one local tunnel-client runtime. Running original Chat On Steroids and cos-lite against the same tunnel ID can split MCP requests between different local servers. cos-lite detects an already-running local tunnel-client using the configured tunnel ID and refuses to start that duplicate runtime with a clear error.
 
@@ -499,11 +528,7 @@ cos service disable
 cos service status
 ```
 
-The user unit is stored at:
-
-```text
-~/.config/systemd/user/cos-lite.service
-```
+The Linux user unit is stored at `~/.config/systemd/user/cos-lite.service`; the macOS LaunchAgent is at `~/Library/LaunchAgents/ai.cos-lite.daemon.plist`.
 
 `cos service status` reports four distinct facts:
 
@@ -514,7 +539,7 @@ active: true
 linger: true
 ```
 
-`linger: true` means the user manager can start at boot before login. `linger: false` means ordinary user-service startup still works at login/session start.
+On Linux, `linger: true` means the user manager can start at boot before login. On macOS, `startup: at user login (launchd)` is shown instead.
 
 ## One-off / stdio mode
 
@@ -626,7 +651,7 @@ const refs = await tools.code_intel({
 return { file, refs };
 ```
 
-The JavaScript process receives no direct filesystem or child-process grants. On Linux it is additionally placed in fresh user/network/PID namespaces. If the namespace sandbox is unavailable, JavaScript mode fails closed; declarative `exec.calls` remains available.
+On Linux, JavaScript receives no direct filesystem or child-process grants and is additionally isolated with namespaces or systemd seccomp. On macOS, JavaScript mode is disabled until an equivalent process sandbox is implemented; declarative `exec.calls` remains available.
 
 ## Security model
 

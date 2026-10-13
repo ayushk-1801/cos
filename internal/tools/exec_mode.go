@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -272,6 +273,9 @@ type jsSandboxRuntime struct {
 }
 
 func selectJSSandboxRuntime() (jsSandboxRuntime, error) {
+	if runtime.GOOS == "darwin" {
+		return jsSandboxRuntime{}, fmt.Errorf("macOS isolated JavaScript code mode is not implemented; use declarative calls mode")
+	}
 	runtimes := usableNodeRuntimes()
 	if len(runtimes) == 0 {
 		return jsSandboxRuntime{}, fmt.Errorf("no genuine Node.js 20+ runtime found")

@@ -1,0 +1,43 @@
+name: Cross-platform compatibility
+on:
+  push:
+    branches: [main, feat/macos-compatibility]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go build -o cos ./cmd/cos
+      - name: Check CLI version
+        run: ./cos version
+      - name: Compile both Mac architectures
+        if: runner.os == 'macOS'
+        run: |
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /tmp/cos-macos-arm64 ./cmd/cos
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o /tmp/cos-macos-amd64 ./cmd/cos
+
+  release-builds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make dist
+      - name: Check all four release artifacts
+        run: |
+          test -s dist/cos-linux-amd64
+          test -s dist/cos-linux-arm64
+          test -s dist/cos-darwin-amd64
+          test -s dist/cos-darwin-arm64

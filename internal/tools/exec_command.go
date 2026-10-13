@@ -18,7 +18,7 @@ type Executor struct {
 func (e *Executor) ExecDefinition() Tool {
 	return Tool{Definition: Definition{
 		Name: "exec_command", Title: "Run command",
-		Description: "Run one shell command (or a small sequential batch) in an approved Ubuntu project. Project roots are " + e.WS.RootSummary() + ". With multiple projects, workdir must start with /<project>/.... Long-running commands return a session_id that write_stdin can poll or interact with. tty=true allocates a real pseudo-terminal via util-linux script.",
+		Description: "Run one shell command (or a small sequential batch) in an approved project. Project roots are " + e.WS.RootSummary() + ". With multiple projects, workdir must start with /<project>/.... Long-running commands return a session_id that write_stdin can poll or interact with. tty=true allocates a PTY via the host's script utility.",
 		InputSchema: map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
 			"cmd":     map[string]any{"type": "string", "description": "Shell command."},
 			"cmds":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 20, "description": "Sequential commands; joined with set -e semantics."},
