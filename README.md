@@ -357,7 +357,7 @@ curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-releas
 Once the corresponding four-platform assets have been published, the installer detects Linux/macOS and `amd64`/`arm64`, downloads the matching GitHub Release binary, verifies it against `SHA256SUMS`, and installs `cos` to `~/.local/bin` by default. Pin a version with `COS_VERSION`, for example:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | COS_VERSION=0.7.1 bash
+curl -fsSL https://raw.githubusercontent.com/ayushk-1801/cos/main/install-release.sh | COS_VERSION=0.7.2 bash
 ```
 
 

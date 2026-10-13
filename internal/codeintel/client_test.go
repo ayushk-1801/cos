@@ -89,6 +89,13 @@ func TestNearestLanguageRootFallsBackToFileDirectory(t *testing.T) {
 
 func TestVirtualizeRedactsExternalFileURI(t *testing.T) {
 	root := t.TempDir()
+	// macOS temporary directories may be reached through /var -> /private/var.
+	// Workspace roots are canonicalized, so construct LSP URIs from that root.
+	var err error
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ws, err := workspace.NewRoots([]workspace.Root{{Name: "proj", Path: root}})
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +116,11 @@ func TestVirtualizeRedactsExternalFileURI(t *testing.T) {
 
 func TestFilterWorkspaceSymbolsDropsExternalLocations(t *testing.T) {
 	root := t.TempDir()
+	var err error
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ws, err := workspace.NewRoots([]workspace.Root{{Name: "proj", Path: root}})
 	if err != nil {
 		t.Fatal(err)

@@ -29,7 +29,7 @@ func TestResolveRejectsEscapeAndSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(root, "a", "b", "new.txt")
+	want := filepath.Join(w.Root, "a", "b", "new.txt")
 	if p != want {
 		t.Fatalf("got %q want %q", p, want)
 	}
@@ -72,14 +72,14 @@ func TestMultipleRootsRequireExplicitProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Join(a, "a.txt") {
+	if got != filepath.Join(w.Roots[0].Path, "a.txt") {
 		t.Fatalf("got %q", got)
 	}
 	got, err = w.Resolve("two/b.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Join(b, "b.txt") {
+	if got != filepath.Join(w.Roots[1].Path, "b.txt") {
 		t.Fatalf("got %q", got)
 	}
 	if d := w.Display(got); d != "/two/b.txt" {
