@@ -47,9 +47,9 @@ CodeIntel enabled (3 server families found)
 Skills    enabled (7 discovered)
 
 Exposed projects
- ●  /trendseer             ~/Desktop/intern/trendseer_audit
+ ●  /example-app          ~/Projects/example-app
  ●  /mdc                   ~/Desktop/Hackathons/MDC
- ○  /foundationdb          ~/Desktop/foundationdb
+ ○  /sample-service       ~/Projects/sample-service
 
 ↑/↓ or j/k select   space exposure   a add   d remove   b browser   c code-intel
 s start/stop   r restart   t tunnel   i skills   o activity   l logs   u autostart   q quit TUI
@@ -210,7 +210,7 @@ Model-facing Skill paths never expose the native config directory. They look lik
 
 ```text
 ~/.agents/skills/review-pr/SKILL.md
-/foundationdb/.agents/skills/build/SKILL.md
+/sample-service/.agents/skills/build/SKILL.md
 ```
 
 ## Semantic code intelligence
@@ -397,9 +397,9 @@ cos service status
 With multiple projects, model-facing paths are explicit virtual roots:
 
 ```text
-/trendseer/backend/main.py
+/example-app/backend/main.py
 /mdc/src/train.py
-/foundationdb/fdbserver/...
+/sample-service/src/...
 ```
 
 Relative paths are intentionally rejected when multiple roots are enabled, so a model cannot accidentally operate on the wrong repository.
@@ -440,10 +440,10 @@ cos audit 100
 cos audit --json 100
 
 cos project list
-cos project add ~/Desktop/intern/trendseer trendseer
-cos project disable trendseer
-cos project enable trendseer
-cos project remove trendseer
+cos project add ~/Projects/example-app example-app
+cos project disable example-app
+cos project enable example-app
+cos project remove example-app
 
 cos skill list
 cos skill add ./review-pr
@@ -641,10 +641,10 @@ An upstream tool named `search` is published as `example.search`.
 When Node 20+ and unprivileged namespaces are available, `exec` can compose local tools:
 
 ```js
-const file = await tools.read({ paths: ["/trendseer/README.md"] });
+const file = await tools.read({ paths: ["/example-app/README.md"] });
 const refs = await tools.code_intel({
   action: "references",
-  path: "/trendseer/backend/service.go",
+  path: "/example-app/backend/service.go",
   line: 42,
   column: 10
 });
