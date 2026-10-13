@@ -47,7 +47,7 @@ import (
 	"github.com/ayush/cos-lite/internal/workspace"
 )
 
-const version = "0.7.0"
+const version = "0.7.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {

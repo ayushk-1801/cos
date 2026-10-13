@@ -64,6 +64,10 @@ func Default() Config {
 }
 
 func Dir() (string, error) {
+	// Respect XDG_CONFIG_HOME even on macOS, which otherwise defaults to Application Support.
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "cos-lite"), nil
+	}
 	d, err := os.UserConfigDir()
 	if err != nil {
 		return "", err

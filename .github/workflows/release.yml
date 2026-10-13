@@ -1,0 +1,60 @@
+name: Publish COS Lite release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify tag matches binary version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^const version = "\([^"]*\)"/\1/p' cmd/cos/main.go)"
+          test "v${version}" = "${GITHUB_REF_NAME}"
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go build -o cos ./cmd/cos
+      - run: ./cos version
+
+  publish:
+    name: Build and publish all platforms
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make dist
+      - name: Prepare and verify release checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum cos-linux-amd64 cos-linux-arm64 cos-darwin-amd64 cos-darwin-arm64 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/cos-linux-amd64 dist/cos-linux-arm64 \
+            dist/cos-darwin-amd64 dist/cos-darwin-arm64 \
+            dist/SHA256SUMS install-release.sh \
+            --verify-tag \
+            --title "cos-lite $GITHUB_REF_NAME" \
+            --notes "Cross-platform release for Linux and macOS (Intel and Apple Silicon). Includes launchd, terminal, browser and CLI compatibility; JavaScript code-mode remains disabled on macOS pending equivalent isolation."
